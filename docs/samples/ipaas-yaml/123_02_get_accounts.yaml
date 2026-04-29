@@ -1,0 +1,46 @@
+name: get_accounts
+description: |
+  Fetch a list of Person Account records by Id. The agent navigates here
+  from the Case (Scribe step 5: "Click owner's name to open Person Account")
+  before checking ownership intervals or making the call.
+
+  This atom validates that an AccountId from a Case actually points to a
+  Person Account and surfaces the identity fields downstream steps depend on.
+
+trigger:
+  type: manual
+  input_schema:
+    account_ids:
+      type: array
+      items: string
+      required: true
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    # Nango Proxy: GET https://api.nango.dev/proxy/{endpoint}
+    title: Get Accounts by Id
+    provider: salesforce
+    method: GET
+    endpoint: /services/data/v59.0/query
+    query:
+      q: |
+        SELECT Id, Name, IsPersonAccount, RecordTypeId,
+               PersonContactId, PersonEmail, PersonHomePhone
+        FROM Account
+        WHERE Id IN ({{ input.account_ids | sql_in_list }})
+        ORDER BY Name
+
+  - id: 2
+    type: response
+    title: Return account list
+    body: "{{ nodes.1.body.records }}"
+
+edges:
+  - from: 1
+    to: 2

@@ -1,0 +1,125 @@
+name: soql_open_cases
+description: |
+  Fetch open ResCon Cases via SOQL that encodes the full pre-call contract
+  in code.
+
+  Filters (intersect of the customer's production ``ResCon_today`` list view
+  AND operational guidance):
+
+    1. Reason = 'RC: ResCon'                         — ResCon workflow only
+       (standard Case picklist; UI label "Case Reason"; NOT a __c field)
+    2. Status IN ('Active','Open','Re-Opened')       — excludes Closed
+    3. Total_Amount_Due__c <= 50 OR NULL             — Scribe $50 gate
+    4. Subject NOT LIKE '%Will Use My Week, ...%'    — excludes WUMW records
+    5. Waitlist_Check_in_Date__c >= TODAY            — past dates should be
+                                                       skipped because those
+                                                       reservations have
+                                                       already been missed.
+
+  Filters 1-4 mirror the 6-filter set on the ``ResCon_today`` saved list
+  view. Filter 5 is NOT on that view — past dates should be skipped but
+  the SF view owner hasn't added it. Enforcing it here keeps us correct
+  regardless of list-view drift.
+
+  Phase 1 scope: only Accounts with exactly one future open date are
+  callable. Accounts with multiple future dates are deferred to Phase 2
+  (chronological looping). That grouping happens in ``pre-call-pipeline``
+  (transform node, post-dedupe) — keeping the SOQL single-shot so the
+  eligibility numerator (total matching rows) is still auditable vs the
+  final dial count.
+
+trigger:
+  type: manual
+  input_schema:
+    # Optional check-in date window. Both bounds accept SOQL date
+    # literals (``TODAY``, ``NEXT_N_DAYS:30``, etc.) OR ISO date
+    # strings (``2026-06-01``). Values interpolate into the SOQL WHERE
+    # clause verbatim — no quotes added — so stick to things SOQL
+    # accepts unquoted.
+    #
+    # Defaults (applied by node 1's normalizer when a caller omits
+    # them or passes an empty string) keep production-scheduler
+    # behavior identical to the pre-parameterization version:
+    # ``>= TODAY`` with no practical upper bound.
+    check_in_start:
+      type: string
+      required: false
+      default: "TODAY"
+    check_in_end:
+      type: string
+      required: false
+      default: "2099-12-31"
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: transform
+    title: Normalize date window (fill in defaults)
+    description: |
+      Defaults live HERE (not only in ``input_schema.default``) so
+      they apply uniformly across all three trigger paths — the
+      Temporal scheduler's trigger-input-override JSON, the UI Run
+      dialog, and any subflow caller that may omit the keys entirely.
+      An undefined or empty-string input lands as ``TODAY`` /
+      ``2099-12-31`` before the nango_proxy interpolates them into
+      the SOQL string. Keeping this a small transform means only one
+      place to reason about "what happens if the caller didn't pass
+      dates?".
+    input:
+      start: "{{ input.check_in_start }}"
+      end:   "{{ input.check_in_end }}"
+    expression: |
+      {
+        "check_in_start": start and start != "" ? start : "TODAY",
+        "check_in_end":   end   and end   != "" ? end   : "2099-12-31"
+      }
+
+  - id: 2
+    type: nango_proxy
+    # Nango Proxy: GET https://api.nango.dev/proxy/services/data/v59.0/query
+    # Runtime handles OAuth token refresh + instance URL routing + query
+    # string encoding transparently. SF REST returns:
+    #   { totalSize: N, done: bool, records: [ {...flat case fields...} ] }
+    # Unlike the list-view endpoint (which wraps each record in a
+    # {columns:[{fieldNameOrPath,value}]} envelope), /query returns fields
+    # as plain JSON keys — no flatten step needed downstream.
+    title: Query open ResCon cases (SOQL)
+    provider: salesforce
+    method: GET
+    endpoint: /services/data/v59.0/query
+    query:
+      q: |
+        SELECT Id, CaseNumber, AccountId, Account.Name,
+               Account.GPX_Exchange__c, Account.Phone, Account.PersonMobilePhone,
+               Account_Owner_Type__c,
+               SPI_Reservation__r.Reservation_Type__c,
+               Subject, Status, Reason,
+               Waitlist_Check_in_Date__c, WaitList_Check_Out_Date__c,
+               Total_Amount_Due__c, City__c,
+               Case_Home_Phone__c, Case_Cell_Phone__c, Case_Work_Phone__c,
+               Person_Account_Email__c,
+               Resort_Name__c, Related_GPR_Resort__r.Name,
+               Certificate_Number__c
+        FROM Case
+        WHERE Reason = 'RC: ResCon'
+          AND Status IN ('Active', 'Open', 'Re-Opened')
+          AND (Total_Amount_Due__c <= 50 OR Total_Amount_Due__c = NULL)
+          AND (NOT Subject LIKE '%Will Use My Week, Please confirm%')
+          AND Waitlist_Check_in_Date__c >= {{ nodes.1.output.check_in_start }}
+          AND Waitlist_Check_in_Date__c <= {{ nodes.1.output.check_in_end }}
+        ORDER BY AccountId, Waitlist_Check_in_Date__c ASC
+
+  - id: 3
+    type: response
+    title: Return SOQL query result
+    body: "{{ nodes.2.body }}"
+
+edges:
+  - from: 1
+    to: 2
+  - from: 2
+    to: 3

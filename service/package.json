@@ -1,0 +1,26 @@
+{
+  "name": "voice-eval-service",
+  "version": "0.1.0",
+  "description": "Microservice that generates Zenarate test suites from voice agents.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/http/server.ts",
+    "start": "tsx src/http/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "dotenv": "^16.4.5",
+    "hono": "^4.6.0",
+    "openai": "^4.65.0",
+    "zenlabs-web-typescript": "file:../../../../Downloads/zenlabs-sdk-master/web/typescript",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}

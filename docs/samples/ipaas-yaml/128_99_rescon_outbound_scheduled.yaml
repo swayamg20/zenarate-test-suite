@@ -1,0 +1,232 @@
+name: rescon_outbound_scheduled
+description: |
+  End-to-end ResCon outbound pipeline intended to run on a Temporal Schedule
+  (see ``apps/service/scripts/apply_schedules.py``). No manual trigger_input
+  beyond ``phone_number_id`` + ``zen_workflow_id`` — eligible contacts come
+  from Salesforce, so rows are NOT user-supplied.
+
+  Pipeline:
+    1. subflow    → 05_pre_call_all (Salesforce eligibility pipeline) → rows
+    2. transform  → shape rows into ``{contacts}`` envelope for batch_call
+    3. batch_call → fan-out dials (empty-contacts guard is handled inside
+                    BatchCallWorkflow — it short-circuits to a zero-result
+                    envelope, so no explicit guard node is needed here)
+    4. subflow    → 06_post_call_all (SF VoiceCall + Case close per row,
+                    branching on call outcome: confirmed vs no-contact)
+    5. response   → summary counts surfaced to the run detail page
+
+  Co-located with 05_pre_call_all so subflow resolution stays sibling-by-name (the
+  engine's subflow handler rejects cross-suite filesystem refs).
+
+trigger:
+  type: manual
+  input_schema:
+    phone_number_id:
+      type: integer
+      required: true
+    zen_workflow_id:
+      type: integer
+      required: true
+    only_phone:
+      # Optional single-contact filter for manual testing. When set, node 2
+      # filters the 05_pre_call_all output down to the one row whose ``phone`` matches
+      # (E.164, exact string compare). The scheduler always omits this so
+      # production runs dial every eligible contact.
+      type: string
+      required: false
+    dry_run:
+      type: boolean
+      required: false
+
+    # Optional check-in date window — forwarded down through 05 to 01's
+    # SOQL WHERE clause. Accepts SOQL date literals (``TODAY``,
+    # ``NEXT_N_DAYS:30``) or ISO date strings (``2026-06-01``). Defaults
+    # live in 01's normalizer node (``TODAY`` / ``2099-12-31``), which
+    # reproduce the pre-parameterization behavior when either key is
+    # omitted. Scheduler typically omits these for ongoing today-forward
+    # dialing; QA replays or narrow-window tests set them via the
+    # trigger-input-override JSON on the admin schedule page or via the
+    # UI Run dialog.
+    check_in_start:
+      type: string
+      required: false
+    check_in_end:
+      type: string
+      required: false
+
+    # Post-call wrap-up metadata — forwarded to node 99 (06_post_call_all).
+    # call_source / call_disposition are campaign-scoped (defaults in 06).
+    # call_detail_1 is outcome-dependent (computed inside 06, not here).
+    # from_phone is auto-derived from voice-py enrichment signal.
+    from_phone:
+      # E.164 Twilio number the dial originates from. Now auto-derived
+      # from ``phone_number_id`` via voice-py's enrichment signal
+      # (collected_variables.from_phone). Only needed as an override
+      # if the Twilio number differs from the one voice-py resolved.
+      type: string
+      required: false
+    call_center_id:
+      # SF CallCenter.Id. GPR prod uses "04vSu00000JGXgDIAX".
+      type: string
+      required: false
+    call_source:
+      type: string
+      default: "OS"
+      required: false
+    call_disposition:
+      type: string
+      default: "OS: ResCon"
+      required: false
+    # call_detail_1 removed — now outcome-dependent, computed inside
+    # 06_post_call_all's node 1 transform (confirmed → "OS: ResCon Success",
+    # no_contact → "OS: ResCon No Contact").
+
+nodes:
+  - id: 1
+    type: subflow
+    title: Fetch eligible callables from Salesforce (05_pre_call_all)
+    workflow_file: ../05_pre_call_all/workflow.yaml
+    # Forward the optional date window down to 05 → 01's SOQL. 01's
+    # normalizer handles the undefined-or-empty fallback, so passing
+    # {{ input.* }} verbatim here is safe even when the scheduler (or
+    # Run dialog) omits both keys.
+    input:
+      check_in_start: "{{ input.check_in_start }}"
+      check_in_end:   "{{ input.check_in_end }}"
+
+  - id: 2
+    type: transform
+    title: Shape rows into {contacts} envelope for batch_call
+    description: |
+      Maps 05_pre_call_all's flat row shape into batch_call's expected
+      ``{contacts: [{phone, variables}]}`` envelope. Every Salesforce key
+      the agent script or the post-call subflow (06_post_call_all) needs rides
+      inside ``variables`` so it reaches voice-py verbatim.
+    input:
+      # 05_pre_call_all's response body is now a dict:
+      #   { callables: [...rows...], counts: {...}, deferred_multi_date: [...] }
+      # ``subflow_handler`` unwraps the response body into ``nodes.1.output``
+      # (not ``nodes.1.output.body`` — that pattern is only for ``nango_proxy``
+      # nodes, where the HTTP response body lives alongside status/headers).
+      rows: "{{ nodes.1.output.callables }}"
+      only_phone: "{{ input.only_phone }}"
+    # Outer [] forces array context — $map over an empty list returns
+    # undefined (→ None) otherwise, which would poison batch_call's
+    # iterate_over template with a non-iterable. Keep as list, always.
+    #
+    # ``only_phone`` is a manual-test knob. When the trigger_input carries
+    # a non-empty string, we slice ``rows`` down to the single matching
+    # contact before mapping; the scheduler omits it so production runs
+    # dial everyone.
+    expression: |
+      (
+        $filtered := only_phone and only_phone != "" ? $filter(rows, function($r) { $r.phone = only_phone }) : rows;
+        {
+          "contacts": [$map($filtered, function($r) {
+            {
+              "phone": $r.phone,
+              "variables": {
+                "contact_name":    $r.first_name & " " & $r.last_name,
+                "first_name":      $r.first_name,
+                "last_name":       $r.last_name,
+                "account_id":      $r.account_id,
+                "account_name":    $r.account_name,
+                "contact_id":      $r.contact_id,
+                "email":           $r.email,
+                "case_id":         $r.case_id,
+                "case_number":     $r.case_number,
+                "subject":         $r.subject,
+                "city":            $r.city,
+                "check_in_date":   $r.check_in_date,
+                "check_out_date":  $r.check_out_date,
+                "resort":          $r.resort,
+                "contract_id":     $r.contract_id,
+                "sum_past_due":    $r.sum_past_due,
+                "customer_type":                  $r.customer_type,
+                "account_owner_type":             $r.account_owner_type,
+                "resort_name_api":                $r.resort,
+                "customer_first_name_api":        $r.first_name,
+                "customer_reservation_dates_api": $fromMillis($toMillis($r.check_in_date, "[Y]-[M01]-[D01]"), "[MNn] [D1o]") & " to " & $fromMillis($toMillis($r.check_out_date, "[Y]-[M01]-[D01]"), "[MNn] [D1o]"),
+                "customer_type_api":              $r.customer_type ? $r.customer_type : "owner"
+              }
+            }
+          })],
+          "total": $count($filtered)
+        }
+      )
+
+  - id: 3
+    type: batch_call
+    title: Fan out per-contact dials
+    iterate_over: "{{ nodes.2.output.contacts }}"
+    item_alias: contact
+    concurrency: 5
+    child_workflow: outbound_call
+    phone_number_id: "{{ input.phone_number_id }}"
+    zen_workflow_id: "{{ input.zen_workflow_id }}"
+    child_input:
+      phone: "{{ contact.phone }}"
+      variables: "{{ contact.variables }}"
+    child_execution_timeout_seconds: 900
+    child_run_timeout_seconds: 600
+
+  # ---------------------------------------------------------------------
+  # Node 99 — Post-call Salesforce writeback (composite subflow).
+  #
+  # Dispatches to the confirmed / no-contact close atoms per row based on
+  # ``result.success``. See ../06_post_call_all/workflow.yaml for the
+  # branching logic; _atoms/case_close_{confirmed,no_contact} for the
+  # individual VoiceCall + Case PATCH payloads.
+  #
+  # Wrap-up metadata (from_phone, call_center_id, call_source/disposition/
+  # detail_1) is identical across all rows in one campaign run, so pass it
+  # once at the composite input boundary rather than per-row in variables.
+  # ---------------------------------------------------------------------
+  - id: 99
+    type: subflow
+    title: Post-call Salesforce writeback
+    workflow_file: ../06_post_call_all/workflow.yaml
+    input:
+      results:          "{{ nodes.3.output.results }}"
+      # Campaign-scoped metadata. ``from_phone`` is auto-derived from
+      # voice-py's enrichment signal; call_center_id is per-tenant.
+      # call_source / call_disposition have safe defaults in 06's transform.
+      # call_detail_1 is outcome-dependent (computed inside 06, not passed).
+      from_phone:       "{{ input.from_phone }}"
+      call_center_id:   "{{ input.call_center_id }}"
+      call_source:      "{{ input.call_source }}"
+      call_disposition: "{{ input.call_disposition }}"
+
+  - id: 4
+    type: response
+    title: Summary counts (pre-call → dial → post-call)
+    body:
+      # Pre-call layer (05_pre_call_all Phase 1 gate)
+      soql_matches:         "{{ nodes.1.output.counts.total_soql_matches }}"
+      distinct_accounts:    "{{ nodes.1.output.counts.distinct_accounts }}"
+      phase1_eligible:      "{{ nodes.1.output.counts.phase1_eligible }}"
+      deferred_multi_date:  "{{ nodes.1.output.counts.deferred_multi_date }}"
+      # Dial layer (batch_call)
+      total:                "{{ nodes.3.output.total }}"
+      completed:            "{{ nodes.3.output.completed }}"
+      failed:               "{{ nodes.3.output.failed }}"
+      total_call_seconds:   "{{ $sum(nodes.3.output.results.duration_seconds) }}"
+      # Post-call writeback layer (06_post_call_all composite)
+      confirmed_count:      "{{ nodes.99.output.confirmed_count }}"
+      no_contact_count:     "{{ nodes.99.output.no_contact_count }}"
+      skipped_count:        "{{ nodes.99.output.skipped_count }}"
+      voice_calls_created:  "{{ nodes.99.output.voice_calls_created }}"
+      post_call_rows:       "{{ nodes.99.output.rows }}"
+      # Per-call collected variables from the enrichment signal — surfaced
+      # here so the run detail page shows what the bot collected per contact.
+      call_results:         "{{ nodes.3.output.results }}"
+
+edges:
+  - from: 1
+    to: 2
+  - from: 2
+    to: 3
+  - from: 3
+    to: 99
+  - from: 99
+    to: 4

@@ -1,0 +1,52 @@
+name: get_ownership_intervals
+description: |
+  Fetch all Ownership_Interval__c records for a given list of Person Account
+  Ids. This is the source of truth for owner financial state per the Scribe:
+  Total_Amount_Past_Due__c, Days_Past_Due__c, Delinquent__c, Contract_Status__c.
+
+  The relationship field on Ownership_Interval__c that points to the Person
+  Account is `Property_Owner__c` (label "Property Owner"), discovered via
+  describe — NOT `Account__c` which does not exist on this object.
+
+trigger:
+  type: manual
+  input_schema:
+    account_ids:
+      type: array
+      items: string
+      required: true
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    # Nango Proxy: GET https://api.nango.dev/proxy/{endpoint}
+    title: Get Ownership Intervals by Property Owner
+    provider: salesforce
+    method: GET
+    endpoint: /services/data/v59.0/query
+    query:
+      q: |
+        SELECT Property_Owner__c, Id, Name,
+               Total_Amount_Past_Due__c, Total_Balance_Due__c,
+               Current_Amount_Due__c, Days_Past_Due__c,
+               Delinquent__c, Contract_Status__c, Owner_Status__c,
+               Last_Payment_Amount__c, Date_of_Last_Payment__c
+        FROM Ownership_Interval__c
+        WHERE Property_Owner__c IN ({{ input.account_ids | sql_in_list }})
+        ORDER BY Property_Owner__c, Id
+
+  - id: 2
+    type: response
+    title: Return ownership intervals grouped by account
+    body:
+      records: "{{ nodes.1.body.records }}"
+      total_count: "{{ nodes.1.body.totalSize }}"
+
+edges:
+  - from: 1
+    to: 2

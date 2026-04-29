@@ -1,0 +1,88 @@
+name: batch_call_smoke
+description: |
+  End-to-end parent DAG composing the 4 outbound templates:
+  pre-call transform → batch dial fan-out → post-call reduce.
+
+  Phase 2 ships this as a YAML-parses-and-validates atom only; the
+  ``batch_call`` node cannot run outside a Temporal context, so the atom
+  runner skips execution until Phase 3 lands the dispatcher.
+
+trigger:
+  type: manual
+  input_schema:
+    rows:
+      type: array
+      required: true
+    # Phase 10.9 — sourced from the phone-number page context (URL [id]) so
+    # the Test Outbound Call dialog can dispatch this scenario without the
+    # user having to know the FK. Templated into ``batch_call.phone_number_id``
+    # below so the same scenario works for any imported number.
+    phone_number_id:
+      type: integer
+      required: true
+    # Phase 10.11 — agent the call runs (which script the contact hears).
+    # Defaults in the dialog to the phone number's ``inbound_workflow`` so
+    # the same agent the user just configured for inbound is reused for the
+    # outbound test. Templated into ``batch_call.zen_workflow_id`` below.
+    zen_workflow_id:
+      type: integer
+      required: true
+
+nodes:
+  - id: 1
+    type: subflow
+    title: Pre-call transform — shape rows into contacts
+    mode: activity
+    workflow_file: ../pre_call_transform/workflow.yaml
+    input:
+      rows: "{{ input.rows }}"
+
+  - id: 2
+    type: batch_call
+    title: Fan out per-contact dials
+    iterate_over: "{{ nodes.1.output.contacts }}"
+    item_alias: contact
+    concurrency: 5
+    child_workflow: outbound_call
+    # Batch-level identity for voice-py's /integrations/twilio/phone/outbound:
+    # every contact in this fan-out dials from the same Twilio pool and runs
+    # the same agent script. Simulation ignores these; execution mode requires
+    # both to be valid IDs or voice-py will reject the POST.
+    # ``phone_number_id`` is templated from the run's trigger_input so the
+    # phone-number page can dispatch this scenario for any imported number
+    # without re-authoring YAML (Phase 10.9). ``zen_workflow_id`` is also
+    # templated (Phase 10.11) so the dialog's Agent picker drives the
+    # script the contact hears.
+    phone_number_id: "{{ input.phone_number_id }}"
+    zen_workflow_id: "{{ input.zen_workflow_id }}"
+    child_input:
+      phone: "{{ contact.phone }}"
+      variables: "{{ contact.variables }}"
+    child_execution_timeout_seconds: 900
+    child_run_timeout_seconds: 600
+
+  - id: 3
+    type: subflow
+    title: Post-call reduce
+    mode: activity
+    workflow_file: ../post_call_reducer/workflow.yaml
+    input:
+      results: "{{ nodes.2.output.results }}"
+      total: "{{ nodes.2.output.total }}"
+
+  - id: 4
+    type: response
+    title: Shape final report
+    body:
+      total: "{{ nodes.3.output.total }}"
+      completed: "{{ nodes.3.output.completed }}"
+      failed: "{{ nodes.3.output.failed }}"
+      total_duration_s: "{{ nodes.3.output.total_duration_s }}"
+
+edges:
+  - from: 1
+    to: 2
+  - from: 2
+    to: 3
+  - from: 3
+    to: 4

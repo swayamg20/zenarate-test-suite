@@ -1,0 +1,245 @@
+name: close_case_confirmed
+description: |
+  Post-call writeback for the ANSWERED / Confirmed branch.
+
+  Mirrors the legacy post-call logging flow — the positive
+  (outcome=completed) path:
+
+    1. POST /sobjects/VoiceCall  -> create VoiceCall record linked to the
+       Case + Account, with all wrap-up fields (call source, disposition,
+       resort, summary, transcript, detail).
+    2. PATCH /sobjects/Case/{id} -> flip Case to Closed with
+       Resolution_Code__c = "RC: Confirmed" and
+       Case_Resolution_Detail_v2__c = "RC: Will Use".
+
+  Both calls are made via Nango Proxy with the existing salesforce
+  connection (sibling pattern with soql-open-cases). No conditional logic
+  inside this atom — the branch decision is handled one level up in
+  ../post-call-pipeline/.
+
+  Field surface mirrors the production VoiceCall body verbatim so the
+  resulting SF record is equivalent to what the legacy system creates.
+
+trigger:
+  type: manual
+  input_schema:
+    # Identifiers — flow upstream from the orchestrator's batch_call
+    # result envelope.
+    case_id:
+      type: string
+      required: true
+    account_id:
+      type: string
+      required: true
+
+    # VoiceCall metadata — supplied by voice-py / Twilio side of the dial.
+    from_phone:
+      type: string
+      required: true
+    to_phone:
+      type: string
+      required: true
+    call_timestamp:
+      # ISO 8601, used for both CallStartDateTime and CallEndDateTime.
+      # The legacy system uses the same value for both (instantaneous
+      # record at the end of the dial); preserve that semantic until we
+      # have a real start/end pair to wire in.
+      type: string
+      required: true
+    call_sid:
+      # Twilio CallSid -> SF VoiceCall.VendorCallKey (idempotency anchor).
+      type: string
+      required: true
+    call_center_id:
+      # SF CallCenter.Id — resolved per-tenant. Pass through as input so
+      # we can parametrize per env.
+      type: string
+      required: true
+
+    # Wrap-up fields — populated by the agent / summarizer post-call.
+    resort:
+      # Pass the Case.Resort_Name__c LABEL verbatim (what voice-py
+      # surfaces to the agent). Node 1 coerces LABEL -> VC picklist
+      # VALUE before the POST because ``VoiceCall.GPR_Resort__c`` is a
+      # restricted picklist that matches on value, not label.
+      type: string
+      required: true
+    summary:
+      type: string
+      required: true
+    transcript:
+      # Full agent/customer transcript. Kept for future use (e.g. a
+      # dedicated Transcript__c field). Currently NOT written to Description.
+      type: string
+      required: false
+    description:
+      # Formatted collected_variables (key: value per line). Written to
+      # VoiceCall.Description so SF ops can see what the bot collected.
+      type: string
+      required: true
+    call_source:
+      type: string
+      default: "OS"
+      required: false
+    call_disposition:
+      type: string
+      default: "OS: ResCon"
+      required: false
+    call_detail_1:
+      type: string
+      default: "OS: ResCon Success"
+      required: false
+
+constants:
+  # ResCon outbound is always Outbound, never Inbound. Kept as a constant
+  # rather than an input to make accidental misuse (e.g. inbound SF
+  # writeback) harder.
+  call_type: "Outbound"
+  vendor_type: "Custom"
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: transform
+    # RESORT COERCION — cross-picklist translation from Case to VoiceCall.
+    #
+    # ``VoiceCall.GPR_Resort__c`` is a RESTRICTED picklist. The SF REST
+    # API validates POST bodies against the picklist VALUE, not the
+    # LABEL.
+    #
+    # Divergences between Case.Resort_Name__c and VC.GPR_Resort__c
+    # (each would trigger INVALID_OR_NULL_FOR_RESTRICTED_PICKLIST):
+    #
+    #   1. Label/value split — same resort, different stored string:
+    #        "Red Wolf Lodge at Olympic Valley" -> "Red Wolf Lodge at Squaw Valley"
+    #   2. Typo-ish — singular/plural + "Resort" suffix drift:
+    #        "Makai Club Resort Condo" -> "Makai Club Resort Condos"
+    #        "Lea Casa"                -> "Lea Casa Resort"
+    #   3. Case-only concepts with no VC analog — GPX wholesale brand,
+    #      Grand Pacific Palisades variants, and the parent brand
+    #      "Grand Pacific Resorts". We don't guess at a mapping here
+    #      (picking the wrong resort pollutes SF reporting); they fall
+    #      through to the "Not Applicable" fallback below.
+    #
+    # Fix shape:
+    #   a. $resortAliases  — explicit map for the high-confidence renames.
+    #   b. $vcResortValues — snapshot of the VC restricted picklist
+    #      VALUES. Anything NOT in this set is replaced with
+    #      "Not Applicable" so the POST never violates the picklist guard.
+    #   c. Label is preserved on the response for debuggability.
+    title: Coerce Case resort -> VC picklist value (with Not Applicable fallback)
+    input:
+      resort: "{{ input.resort }}"
+    expression: |
+      (
+        $resortAliases := {
+          "Red Wolf Lodge at Olympic Valley": "Red Wolf Lodge at Squaw Valley",
+          "Makai Club Resort Condo":          "Makai Club Resort Condos",
+          "Lea Casa":                         "Lea Casa Resort"
+        };
+        $vcResortValues := [
+          "Not Applicable",
+          "Canyon Rim at Eagle Crest",
+          "Capistrano Surfside Inn",
+          "Carlsbad Inn Beach Resort",
+          "Carlsbad Seapointe Resort",
+          "Channel Island Shores",
+          "Circle J Club",
+          "Club Tahoe Resort",
+          "Coronado Beach Resort",
+          "French Lick Villas",
+          "Grand Pacific Palisades Resort",
+          "Grand Pacific Vacation Club",
+          "Hanalei Bay Resort",
+          "Hilton Grand Vacations Club at MarBrisa",
+          "Indian Palms Vacation Club",
+          "Lea Casa Resort",
+          "Makai Club Resort Condos",
+          "Makai Club Resort Cottages",
+          "Olympic Village Inn",
+          "Red Wolf Lakeside Lodge",
+          "Red Wolf Lodge at Squaw Valley",
+          "RiverPointe Napa Valley",
+          "San Clemente Cove",
+          "San Clemente Inn",
+          "San Diego Country Estates",
+          "Southern California Beach Club",
+          "Tahoe Sands Resort",
+          "Villa L'Auberge",
+          "Vista Mirage Resort",
+          "Wave Crest Resort"
+        ];
+        $aliased   := $lookup($resortAliases, resort);
+        $candidate := $aliased ? $aliased : resort;
+        $final     := $candidate in $vcResortValues ? $candidate : "Not Applicable";
+        {
+          "resort_label":    resort,
+          "resort_aliased":  $aliased,
+          "resort_candidate": $candidate,
+          "resort_value":    $final
+        }
+      )
+
+  - id: 2
+    type: nango_proxy
+    # Create the VoiceCall record. SF returns { id, success, errors[] };
+    # we surface the id so the caller can correlate the SFDC VC PK with
+    # our internal call run.
+    title: Create VoiceCall record (linked to Case + Account)
+    provider: salesforce
+    method: POST
+    endpoint: /services/data/v59.0/sobjects/VoiceCall
+    body:
+      CallType:           "{{ constants.call_type }}"
+      FromPhoneNumber:    "{{ input.from_phone }}"
+      ToPhoneNumber:      "{{ input.to_phone }}"
+      CallStartDateTime:  "{{ input.call_timestamp }}"
+      CallEndDateTime:    "{{ input.call_timestamp }}"
+      VendorCallKey:      "{{ input.call_sid }}"
+      VendorType:         "{{ constants.vendor_type }}"
+      CallCenterId:       "{{ input.call_center_id }}"
+      Case__c:            "{{ input.case_id }}"
+      Account__c:         "{{ input.account_id }}"
+      Call_Source__c:     "{{ input.call_source }}"
+      Call_Disposition__c: "{{ input.call_disposition }}"
+      # Use the coerced picklist VALUE from node 1, NOT the raw label
+      # in input.resort. See node 1's comment block for why.
+      GPR_Resort__c:      "{{ nodes.1.output.resort_value }}"
+      Summary__c:         "{{ input.summary }}"
+      Description:        "{{ input.description }}"
+      Call_Detail_1__c:   "{{ input.call_detail_1 }}"
+
+  - id: 3
+    type: nango_proxy
+    # Flip the Case to Closed with the Confirmed resolution. SF returns
+    # 204 No Content; the proxy surfaces status (no body).
+    title: Close Case as Confirmed (RC=Confirmed, Detail=Will Use)
+    provider: salesforce
+    method: PATCH
+    endpoint: "/services/data/v59.0/sobjects/Case/{{ input.case_id }}"
+    body:
+      Status: "Closed"
+      Resolution_Code__c: "RC: Confirmed"
+      Case_Resolution_Detail_v2__c: "RC: Will Use"
+
+  - id: 4
+    type: response
+    title: Return wrap-up summary
+    body:
+      voice_call_id:    "{{ nodes.2.body.id }}"
+      voice_call_ok:    "{{ nodes.2.body.success }}"
+      case_id:          "{{ input.case_id }}"
+      case_close_status: "{{ nodes.3.status }}"
+      branch:           "confirmed"
+
+edges:
+  - from: 1
+    to: 2
+  - from: 2
+    to: 3
+  - from: 3
+    to: 4

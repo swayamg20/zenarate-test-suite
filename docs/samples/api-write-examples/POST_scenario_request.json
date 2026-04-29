@@ -1,0 +1,18 @@
+{
+  "suite": "<TEST_SUITE_ID>",
+  "name": "auth_happy_path_confirmed",
+  "description": "Customer confirms identity on first ask",
+  "description_long": "# auth_happy_path_confirmed\n\nMarkdown documentation for the scenario.",
+  "personality": "Polite, cooperative customer who picks up promptly.",
+  "node_codes": [{"node_title": "Authentication", "order": 0}],
+  "turns": [
+    {"text": "Yes, this is John speaking.", "expected_replies": 1},
+    {"text": "Yes, please go ahead."}
+  ],
+  "assertions": {
+    "min_responses": 2,
+    "initial_bot_replies": 1,
+    "extracted_variables": {"confirm_first_name": true, "is_authenticated": "true"}
+  },
+  "initial_state": {"customer_first_name_api": "John"}
+}

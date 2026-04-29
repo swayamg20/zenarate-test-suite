@@ -1,0 +1,42 @@
+name: outbound_call
+description: |
+  Single-dial template that ``batch_call`` spawns as a child workflow per
+  contact. At runtime the Temporal activity POSTs voice-py, then the workflow
+  waits for a Twilio-status signal and resolves to a
+  ``{status, duration_seconds}`` result.
+
+  In simulation this atom exercises just the ``http_proxy`` + response shape;
+  Phase 3 wires the signal-wait around it.
+
+trigger:
+  type: manual
+  input_schema:
+    phone:
+      type: string
+      required: true
+    variables:
+      type: object
+      required: false
+
+nodes:
+  - id: 1
+    type: http_proxy
+    title: POST voice-py outbound dial
+    service: voice_py
+    method: POST
+    endpoint: /integrations/twilio/phone/outbound
+    body:
+      to_number: "{{ input.phone }}"
+      variables: "{{ input.variables }}"
+
+  - id: 2
+    type: response
+    title: Shape outbound_call response
+    body:
+      http_status: "{{ nodes.1.status }}"
+      call_sid: "{{ nodes.1.body.call_sid }}"
+      status: "{{ nodes.1.body.status }}"
+
+edges:
+  - from: 1
+    to: 2

@@ -1,0 +1,118 @@
+name: sample_voicecall_content
+description: |
+  Diagnostic atom — SOQL-queries VoiceCall records that have either
+  ``Summary__c`` or ``Description`` populated and returns the first 5,
+  complete with both text fields plus enough context
+  (Case__c, Account__c, Call_Disposition__c, timestamps) to judge
+  whether the record is a real conversation or a dial-failure stub.
+
+  Purpose: the post-call atom we ship writes an AI-generated summary
+  back to VoiceCall, but we don't know what the humans already put in
+  ``Summary__c`` / ``Description``. Before we template the summary we
+  want to see the shape — is it a transcript? A prose paragraph? A
+  disposition code? A few bullets?
+
+  Used by the audit to pin down target format/length. Also acts as a
+  drift detector — if one day these fields are empty across the sample
+  it means enrichment is off and the AI summary becomes the sole source
+  of truth.
+
+  Note: read-only SOQL — no records are created or modified.
+
+trigger:
+  type: manual
+  input_schema: {}
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    title: SOQL — recent 20 VoiceCalls (unfiltered, client-side filter in node 2)
+    description: |
+      Salesforce's query engine rejects WHERE clauses on long/rich-text
+      fields — ``Summary__c`` is one, so
+      ``WHERE Summary__c != NULL`` returns ``INVALID_FIELD``. We work
+      around it by pulling the most recent 20 VoiceCalls and letting
+      the transform keep those whose ``Summary__c`` or ``Description``
+      is populated. 20 is enough to catch at least a few non-empty
+      records in any sandbox that has enrichment running; if all 20
+      come back empty, that's a meaningful finding ("enrichment is off
+      / hasn't run yet") rather than a query error.
+    provider: salesforce
+    method: GET
+    endpoint: /services/data/v59.0/query
+    query:
+      q: >
+        SELECT Id, Case__c, Account__c, Call_Disposition__c,
+               CallStartDateTime, CallEndDateTime, Summary__c, Description
+        FROM VoiceCall
+        ORDER BY CreatedDate DESC
+        LIMIT 20
+
+  - id: 2
+    type: transform
+    title: Client-side filter + compact + measure
+    description: |
+      Filter to records where either narrative field is populated, then
+      slice to the first 5 for readability. For each kept record emit
+      field lengths alongside the raw text so the caller can eyeball
+      "transcript-length" vs "one-line disposition" without scanning
+      the full body.
+
+      ``scanned_total`` and ``populated_total`` tell you whether the
+      sandbox has any narrative content at all: if populated_total=0
+      after scanning 20, enrichment hasn't run and the AI summary is
+      the sole source of truth.
+    input:
+      records: "{{ nodes.1.body.records }}"
+    expression: |
+      (
+        $populated := $filter(records, function($r) {
+          ($r.Summary__c and $length($r.Summary__c) > 0)
+          or ($r.Description and $length($r.Description) > 0)
+        });
+        $kept := $populated[[0..4]];
+        $sized := $map($kept, function($r) {
+          {
+            "id":                 $r.Id,
+            "case_id":            $r.Case__c,
+            "account_id":         $r.Account__c,
+            "disposition":        $r.Call_Disposition__c,
+            "call_started":       $r.CallStartDateTime,
+            "call_ended":         $r.CallEndDateTime,
+            "summary":            $r.Summary__c,
+            "summary_length":     $r.Summary__c ? $length($r.Summary__c) : 0,
+            "description":        $r.Description,
+            "description_length": $r.Description ? $length($r.Description) : 0
+          }
+        });
+        {
+          "scanned_total":      $count(records),
+          "populated_total":    $count($populated),
+          "total_returned":     $count($sized),
+          "any_summary_set":    $count($filter($sized, function($r) { $r.summary_length > 0 })) > 0,
+          "any_description_set":$count($filter($sized, function($r) { $r.description_length > 0 })) > 0,
+          "records":            $sized
+        }
+      )
+
+  - id: 3
+    type: response
+    title: Return populated VoiceCall sample
+    body:
+      scanned_total:        "{{ nodes.2.output.scanned_total }}"
+      populated_total:      "{{ nodes.2.output.populated_total }}"
+      total_returned:       "{{ nodes.2.output.total_returned }}"
+      any_summary_set:      "{{ nodes.2.output.any_summary_set }}"
+      any_description_set:  "{{ nodes.2.output.any_description_set }}"
+      records:              "{{ nodes.2.output.records }}"
+
+edges:
+  - from: 1
+    to: 2
+  - from: 2
+    to: 3

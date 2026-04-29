@@ -1,0 +1,41 @@
+name: soql_query
+description: |
+  Run any SOQL query against the sandbox. Pass the full query string as
+  input. Useful for ad-hoc investigation without touching the code.
+
+  Example input:
+    { "q": "SELECT Id, Name, Stay_Type__c FROM SPI_Reservation__c LIMIT 5" }
+
+trigger:
+  type: manual
+  input_schema:
+    q:
+      type: string
+      required: true
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    title: Execute SOQL query
+    provider: salesforce
+    method: GET
+    endpoint: /services/data/v59.0/query
+    query:
+      q: "{{ input.q }}"
+
+  - id: 2
+    type: response
+    title: Return query results
+    body:
+      total_size: "{{ nodes.1.body.totalSize }}"
+      done: "{{ nodes.1.body.done }}"
+      records: "{{ nodes.1.body.records }}"
+
+edges:
+  - from: 1
+    to: 2

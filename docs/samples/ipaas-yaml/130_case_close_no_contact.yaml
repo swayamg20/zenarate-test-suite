@@ -1,0 +1,84 @@
+name: post_call_case_close_no_contact
+description: |
+  Post-call writeback for the NO-CONTACT / Unconfirmed branch.
+
+  Mirrors the legacy post-call logging flow — the negative
+  (outcome != "completed") path:
+
+    PATCH /sobjects/Case/{id} → flip Case to Closed with
+    Resolution_Code__c = "RC: Unconfirmed" and
+    Case_Resolution_Detail_v2__c = "RC: No Contact".
+
+  No VoiceCall record is created in this branch — only calls that reach
+  a person get a VC record. If/when we adopt the "No Contact Case
+  Closure & Email" enrichment (Comments + OwnerId reassignment +
+  agent-routed email), extend this atom; the optional inputs
+  ``agent_notes`` and ``agent_id`` are reserved for that.
+
+trigger:
+  type: manual
+  input_schema:
+    case_id:
+      type: string
+      required: true
+    # Optional enrichments — currently unused by the minimal close-only
+    # behavior. When set, body is extended with Comments and OwnerId so
+    # the SF record includes the richer no-contact payload.
+    agent_notes:
+      type: string
+      required: false
+    agent_id:
+      type: string
+      required: false
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: transform
+    title: Build close payload (with optional enrichments)
+    description: |
+      JSONata builds the body conditionally: required fields always
+      present; Comments/OwnerId only when their inputs are non-empty.
+      Avoids sending null-valued fields to SF (they'd clobber existing
+      values otherwise).
+    input:
+      agent_notes: "{{ input.agent_notes }}"
+      agent_id:    "{{ input.agent_id }}"
+    expression: |
+      $merge([
+        {
+          "Status": "Closed",
+          "Resolution_Code__c": "RC: Unconfirmed",
+          "Case_Resolution_Detail_v2__c": "RC: No Contact"
+        },
+        agent_notes and agent_notes != "" ? { "Comments": agent_notes } : {},
+        agent_id and agent_id != "" ? { "OwnerId": agent_id } : {}
+      ])
+
+  - id: 2
+    type: nango_proxy
+    title: Close Case as Unconfirmed/No Contact
+    provider: salesforce
+    method: PATCH
+    endpoint: "/services/data/v59.0/sobjects/Case/{{ input.case_id }}"
+    body: "{{ nodes.1.output }}"
+
+  - id: 3
+    type: response
+    title: Return close summary
+    body:
+      voice_call_id:     null   # no VC created on this branch
+      voice_call_ok:     false
+      case_id:           "{{ input.case_id }}"
+      case_close_status: "{{ nodes.2.status }}"
+      branch:            "no_contact"
+
+edges:
+  - from: 1
+    to: 2
+  - from: 2
+    to: 3

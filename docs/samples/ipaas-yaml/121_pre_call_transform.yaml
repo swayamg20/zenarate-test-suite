@@ -1,0 +1,43 @@
+name: pre_call_transform
+description: |
+  Shape a list of raw contact rows into the dial-ready ``{phone, variables}``
+  envelope every outbound template expects. Pure engine transform — no
+  external connector — so this atom runs without any connection config.
+
+trigger:
+  type: manual
+  input_schema:
+    rows:
+      type: array
+      required: true
+
+nodes:
+  - id: 1
+    type: transform
+    title: Normalize rows to dial-ready contacts
+    input:
+      rows: "{{ input.rows }}"
+    expression: |
+      {
+        "contacts": [$map(rows, function($r) {
+          {
+            "phone":     $r.phone,
+            "variables": {
+              "contact_name": $r.first_name & " " & $r.last_name,
+              "account_id":   $r.account_id
+            }
+          }
+        })],
+        "total": $count(rows)
+      }
+
+  - id: 2
+    type: response
+    title: Shape contacts list
+    body:
+      contacts: "{{ nodes.1.output.contacts }}"
+      total: "{{ nodes.1.output.total }}"
+
+edges:
+  - from: 1
+    to: 2

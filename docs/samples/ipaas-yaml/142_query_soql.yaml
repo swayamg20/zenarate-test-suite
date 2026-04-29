@@ -1,0 +1,39 @@
+name: sf_query_soql
+description: |
+  Run an arbitrary SOQL query against Salesforce and return the raw response
+  (size, done, records, optional nextRecordsUrl). Most other atoms use this
+  as a building block.
+
+trigger:
+  type: manual
+  input_schema:
+    soql_query:
+      type: string
+      required: true
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    title: Execute SOQL query
+    provider: salesforce
+    method: GET
+    endpoint: /services/data/v59.0/query
+    query:
+      q: "{{ input.soql_query }}"
+
+  - id: 2
+    type: response
+    title: Shape query_soql response
+    body:
+      http_status: "{{ nodes.1.status }}"
+      total_size: "{{ nodes.1.body.totalSize }}"
+      done: "{{ nodes.1.body.done }}"
+      records: "{{ nodes.1.body.records }}"
+
+edges:
+  - from: 1
+    to: 2

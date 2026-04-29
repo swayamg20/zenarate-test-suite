@@ -1,0 +1,21 @@
+name: pre_call_pass_through
+description: |
+  Trivial pre-call template — caller-supplied ``contacts`` flow through
+  unchanged. Useful as the "no-op" pre-call step when the caller already
+  owns a shaped contact list.
+
+trigger:
+  type: manual
+  input_schema:
+    contacts:
+      type: array
+      required: true
+
+nodes:
+  - id: 1
+    type: response
+    title: Forward contacts unchanged
+    body:
+      contacts: "{{ input.contacts }}"
+
+edges: []

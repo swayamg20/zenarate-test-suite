@@ -1,0 +1,166 @@
+name: investigate_voicecall_pattern
+description: |
+  Diagnostic atom — answers three open investigation questions in a
+  single SF round-trip:
+
+    1. What does the existing VoiceCall record for Case 02287032 look
+       like? (node 1 — detailed SOQL for every field we care about).
+    2. Across recent ResCon Cases, how many VoiceCall children does
+       each one have? Is the pattern "1 VC per attempt" or "1 VC only
+       on answer"? (node 2 — subquery-SOQL + histogram transform).
+    3. What disposition/source/detail string combinations actually
+       exist in the VoiceCall corpus today? (node 3 — distinct value
+       enumeration so we know which restricted-picklist values
+       06_post_call_all is allowed to write back).
+
+  Answers #22 (VC count/pattern) + partial answer to #21 (VC field
+  inventory on a real record) without another Chrome click. No input;
+  runs against the seeded sandbox.
+
+  Note: read-only SOQL — no records are created or modified.
+
+trigger:
+  type: manual
+  input_schema: {}
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    title: SOQL — VoiceCall rows linked to the known test Case
+    description: |
+      Pulls every VoiceCall on Case 500Su00000cGeGhIAK with the fields
+      we care about for post-call writeback. If only 1 row comes back
+      and it's an answered call, that's evidence for the "1 VC only
+      on answer" pattern.
+    provider: salesforce
+    method: GET
+    endpoint: /services/data/v59.0/query
+    query:
+      q: >
+        SELECT Id, CallType, CallStartDateTime, CallEndDateTime,
+               VendorCallKey, VendorType, Case__c, Account__c,
+               Call_Source__c, Call_Disposition__c, Call_Detail_1__c,
+               GPR_Resort__c, FromPhoneNumber, ToPhoneNumber,
+               CreatedDate, CallCenterId
+        FROM VoiceCall
+        WHERE Case__c = '500Su00000cGeGhIAK'
+
+  - id: 2
+    type: nango_proxy
+    title: SOQL — recent ResCon Cases + their child VoiceCall count
+    description: |
+      Uses a relationship subquery to fetch the VC children for each
+      Case. Limits to 200 ResCon cases so the response stays small.
+      Transform in node 4 converts this into a VC-count histogram
+      (bucket 0 = cases with no VCs, bucket 1 = cases with exactly
+      one VC, etc).
+    provider: salesforce
+    method: GET
+    endpoint: /services/data/v59.0/query
+    query:
+      q: >
+        SELECT Id, CaseNumber, Status, ClosedDate,
+               (SELECT Id, Call_Disposition__c, CallStartDateTime
+                FROM Voice_Calls__r)
+        FROM Case
+        WHERE RecordType.DeveloperName = 'Res_Con'
+        ORDER BY CreatedDate DESC
+        LIMIT 200
+
+  - id: 3
+    type: nango_proxy
+    title: SOQL — distinct disposition/source/detail combinations
+    description: |
+      Enumerates the unique (Call_Source__c, Call_Disposition__c,
+      Call_Detail_1__c) triples across every VoiceCall in the
+      sandbox. Lets us see what the SF side considers legal without
+      a picklist describe — restricted picklists may not include
+      every string the system actually stores if picklist values were
+      added/removed over time.
+    provider: salesforce
+    method: GET
+    endpoint: /services/data/v59.0/query
+    query:
+      q: >
+        SELECT Call_Source__c, Call_Disposition__c, Call_Detail_1__c,
+               COUNT(Id) cnt
+        FROM VoiceCall
+        GROUP BY Call_Source__c, Call_Disposition__c, Call_Detail_1__c
+        ORDER BY COUNT(Id) DESC
+
+  - id: 4
+    type: transform
+    title: Compute VC-per-case histogram + flatten top-case sample
+    description: |
+      ``nodes.2.body.records`` is an array of Case rows each with a
+      ``Voice_Calls__r`` sub-object (null when no children, otherwise
+      ``{totalSize, done, records: [...]}``). We compute:
+
+        * vc_count_histogram — { "0": N, "1": N, "2": N, ... } counts
+          across the 200 cases.
+        * cases_with_zero_vcs — subset of cases with 0 VCs; if this is
+          ALWAYS empty that's weak evidence for "attempt-per-VC";
+          if it's non-empty the unanswered-call case doesn't get a VC.
+        * cases_with_multiple_vcs — sample of cases with >1 VC (likely
+          retry pattern).
+    input:
+      cases: "{{ nodes.2.body.records }}"
+    expression: |
+      (
+        $countFor := function($c) {
+          $c.Voice_Calls__r ? $count($c.Voice_Calls__r.records) : 0
+        };
+        $counts := $map($cases, function($c) { $countFor($c) });
+        $distinct := $distinct($counts);
+        {
+          "total_cases_sampled": $count($cases),
+          "vc_count_histogram": $merge(
+            $map($distinct, function($n) {
+              { ($string($n)): $count($counts[$ = $n]) }
+            })
+          ),
+          "cases_with_zero_vcs": $count($cases[$countFor($) = 0]),
+          "cases_with_multiple_vcs": $map(
+            $filter($cases, function($c) { $countFor($c) > 1 }),
+            function($c) {
+              {
+                "case_id":     $c.Id,
+                "case_number": $c.CaseNumber,
+                "status":      $c.Status,
+                "vc_count":    $countFor($c)
+              }
+            }
+          )
+        }
+      )
+
+  - id: 5
+    type: response
+    title: Return the VC investigation bundle
+    body:
+      case_voicecalls:
+        total_size: "{{ nodes.1.body.totalSize }}"
+        records:    "{{ nodes.1.body.records }}"
+      case_vc_pattern:
+        total_cases_sampled:       "{{ nodes.4.output.total_cases_sampled }}"
+        vc_count_histogram:        "{{ nodes.4.output.vc_count_histogram }}"
+        cases_with_zero_vcs_count: "{{ nodes.4.output.cases_with_zero_vcs }}"
+        cases_with_multiple_vcs:   "{{ nodes.4.output.cases_with_multiple_vcs }}"
+      disposition_combinations:
+        total_size: "{{ nodes.3.body.totalSize }}"
+        records:    "{{ nodes.3.body.records }}"
+
+edges:
+  - from: 1
+    to: 4
+  - from: 2
+    to: 4
+  - from: 3
+    to: 4
+  - from: 4
+    to: 5

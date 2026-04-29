@@ -1,0 +1,43 @@
+name: post_call_reducer
+description: |
+  Shape a final report from the per-call results ``batch_call`` returns.
+  Counts completed / failed / total-duration and exposes a compact summary
+  downstream scenarios can dump to sinks (CRM, dashboards).
+
+trigger:
+  type: manual
+  input_schema:
+    results:
+      type: array
+      required: true
+    total:
+      type: integer
+      required: true
+
+nodes:
+  - id: 1
+    type: transform
+    title: Aggregate per-call results
+    input:
+      results: "{{ input.results }}"
+      total: "{{ input.total }}"
+    expression: |
+      {
+        "total":             total,
+        "completed":         $count(results[status = "completed"]),
+        "failed":            $count(results[status != "completed"]),
+        "total_duration_s":  $sum(results.duration_seconds)
+      }
+
+  - id: 2
+    type: response
+    title: Shape final report
+    body:
+      total: "{{ nodes.1.output.total }}"
+      completed: "{{ nodes.1.output.completed }}"
+      failed: "{{ nodes.1.output.failed }}"
+      total_duration_s: "{{ nodes.1.output.total_duration_s }}"
+
+edges:
+  - from: 1
+    to: 2

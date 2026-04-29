@@ -1,0 +1,218 @@
+name: post_call_pipeline
+description: |
+  End-to-end post-call writeback composite. Consumes batch_call's per-row
+  result envelope from the orchestrator, branches per row on call outcome,
+  and dispatches to the correct atom:
+
+    reservation_confirmed=true           -> _atoms/close-case-confirmed
+    not answered (no_answer/busy/failed) -> _atoms/close-case-no-contact
+    answered but not confirmed           -> skipped (no case closure)
+      (callback_requested, declined + transferred, wrong number)
+
+  Branching uses collected_variables from the enrichment signal, not just
+  the binary success flag. An answered call where the owner declined or
+  requested a callback should NOT be closed as "RC: Confirmed".
+
+  Pipeline:
+    1. transform -> normalize batch_call results: compute outcome using
+                   collected_variables, split into closeable + skipped
+    2. loop      -> for each closeable result, dispatch to the correct atom
+    3. transform -> roll up per-row outcomes into a single summary
+    4. response  -> return aggregate counts + per-row branch decisions
+
+trigger:
+  type: manual
+  input_schema:
+    # batch_call result envelope, passed in by the orchestrator.
+    # Shape (per-row inside `results`):
+    #   { phone, success: bool, duration_seconds, status, error,
+    #     variables: { case_id, account_id, ... }, call_sid, ... }
+    results:
+      type: array
+      required: true
+
+    # Per-call metadata that's identical across all rows in one campaign run
+    # (resort + agent identity supplied by voice-py / the running instance).
+    # These can be left null and the atoms will pass through; the post-call
+    # SF write will still succeed but the SF wrap-up record will lack them.
+    from_phone:
+      type: string
+      required: false
+    call_center_id:
+      type: string
+      required: false
+    call_source:
+      # Campaign-level label. Fallback "OS" applied in node 1 transform
+      # if omitted or empty (engine does not resolve input_schema defaults).
+      type: string
+      required: false
+    call_disposition:
+      # Campaign-level label. Fallback "OS: ResCon" applied in node 1.
+      type: string
+      required: false
+    # call_detail_1 is NOT an input — it's outcome-dependent, computed
+    # per-row in node 1's transform:
+    #   confirmed  → "OS: ResCon Success"
+    #   no_contact → "OS: ResCon No Contact"
+    #   skipped    → "OS: ResCon" (generic, no atom dispatched)
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: transform
+    title: Normalize batch_call results — outcome-based branching
+    description: |
+      Computes per-row outcome using collected_variables from the
+      enrichment signal, NOT just the binary ``success`` flag:
+
+        reservation_confirmed=true  -> "confirmed"  (close-case-confirmed)
+        success=false               -> "no_contact" (close-case-no-contact)
+        answered but not confirmed  -> "skipped"    (no case closure)
+
+      An answered call where the owner declined, requested a callback,
+      was a wrong number, or was transferred to an agent should NOT be
+      closed as "RC: Confirmed" — those paths are handled by the live
+      agent or will be re-dialed.
+
+      Output is an object with two arrays:
+        closeable — rows that need an atom dispatch (confirmed + no_contact)
+        skipped   — answered calls that don't get automated case closure
+
+      The loop (node 2) iterates only over ``closeable``. The summary
+      (node 3) counts both for the full picture.
+    input:
+      results:          "{{ input.results }}"
+      # Campaign-scoped metadata — same for every row. Must be stamped onto
+      # each row here because the loop handler passes trigger_input={} to
+      # child nodes, so ``{{ input.X }}`` is null inside the loop body.
+      from_phone:       "{{ input.from_phone }}"
+      call_center_id:   "{{ input.call_center_id }}"
+      call_source:      "{{ input.call_source }}"
+      call_disposition: "{{ input.call_disposition }}"
+    expression: |
+      (
+        $enriched := [$map(results, function($r) {
+          (
+            $confirmed := $r.collected_variables.reservation_confirmed = true;
+            $answered  := $r.success = true;
+            $callback  := $r.collected_variables.callback_requested = true;
+            $outcome   := $confirmed          ? "confirmed"
+                        : $answered = false   ? "no_contact"
+                        :                       "skipped";
+            $atom      := $outcome = "confirmed"  ? "close-case-confirmed"
+                        : $outcome = "no_contact" ? "close-case-no-contact"
+                        :                           null;
+            {
+              "outcome":         $outcome,
+              "atom_name":       $atom,
+              "case_id":         $r.variables.case_id,
+              "account_id":      $r.variables.account_id,
+              "to_phone":        $r.phone,
+              "from_phone":      $r.collected_variables.from_phone ? $r.collected_variables.from_phone : from_phone,
+              "call_sid":        $r.call_sid,
+              "call_timestamp":  $r.completed_at ? $r.completed_at : $now(),
+              "resort":          $r.variables.resort,
+              "summary":         $r.collected_variables.summary ? $r.collected_variables.summary : ($r.collected_variables.transcript ? $r.collected_variables.transcript : ""),
+              "transcript":      $r.collected_variables.transcript ? $r.collected_variables.transcript : "",
+              "description":     $r.collected_variables.description ? $r.collected_variables.description : "",
+              "callback_requested":    $callback,
+              "reservation_confirmed": $confirmed,
+              "call_center_id":  call_center_id,
+              "call_source":     call_source and call_source != "" ? call_source : "OS",
+              "call_disposition": call_disposition and call_disposition != "" ? call_disposition : "OS: ResCon",
+              "call_detail_1":   $outcome = "confirmed"  ? "OS: ResCon Success"
+                               : $outcome = "no_contact" ? "OS: ResCon No Contact"
+                               :                           "OS: ResCon"
+            }
+          )
+        })];
+        {
+          "closeable":     [$filter($enriched, function($row) { $row.atom_name != null })],
+          "skipped":       [$filter($enriched, function($row) { $row.atom_name = null })],
+          "skipped_count": $count($filter($enriched, function($row) { $row.atom_name = null })),
+          "total":         $count($enriched)
+        }
+      )
+
+  - id: 2
+    type: loop
+    title: For each result, branch to the right close atom
+    iterate_over: "{{ nodes.1.output.closeable }}"
+    item_alias: row
+    concurrency: 5
+    body:
+      # Branch lives in the body via two subflow refs guarded by the
+      # ``when`` clause (engine convention — only one fires per iteration).
+      # If the engine doesn't support ``when`` on subflows, this collapses
+      # to a single transform-then-subflow pattern.
+      type: subflow
+      # The atom name is pre-computed in node 1's JSONata transform as
+      # ``atom_name`` (ternary on success). The template resolver only
+      # supports dotted-path lookups — NOT ternary expressions — so we
+      # reference the pre-computed field with a simple ``{{ row.atom_name }}``.
+      workflow_file: "../_atoms/{{ row.atom_name }}/workflow.yaml"
+      input:
+        # Confirmed atom needs all 11 fields; no_contact only needs case_id
+        # (+ optional notes/owner). Both atoms ignore unknown inputs (the
+        # ``input_schema`` only declares what they consume), so passing
+        # the union here is safe and keeps the dispatch single-shaped.
+        case_id:          "{{ row.case_id }}"
+        account_id:       "{{ row.account_id }}"
+        from_phone:       "{{ row.from_phone }}"
+        to_phone:         "{{ row.to_phone }}"
+        call_timestamp:   "{{ row.call_timestamp }}"
+        call_sid:         "{{ row.call_sid }}"
+        call_center_id:   "{{ row.call_center_id }}"
+        resort:           "{{ row.resort }}"
+        summary:          "{{ row.summary }}"
+        transcript:       "{{ row.transcript }}"
+        description:      "{{ row.description }}"
+        call_source:      "{{ row.call_source }}"
+        call_disposition: "{{ row.call_disposition }}"
+        call_detail_1:    "{{ row.call_detail_1 }}"
+    collect:
+      case_id:           "{{ subflow.output.case_id }}"
+      branch:            "{{ subflow.output.branch }}"
+      voice_call_id:     "{{ subflow.output.voice_call_id }}"
+      voice_call_ok:     "{{ subflow.output.voice_call_ok }}"
+      case_close_status: "{{ subflow.output.case_close_status }}"
+
+  - id: 3
+    type: transform
+    title: Aggregate per-row outcomes into summary counts
+    description: |
+      Counts confirmed vs no-contact vs skipped closures + VoiceCall
+      successes. ``closed_rows`` comes from the loop (node 2) which only
+      ran on closeable rows. ``skipped`` comes from node 1's pre-filter.
+      ``total`` counts ALL rows so the run detail page tallies correctly.
+    input:
+      closed_rows:   "{{ nodes.2.output }}"
+      skipped:       "{{ nodes.1.output.skipped }}"
+      skipped_count: "{{ nodes.1.output.skipped_count }}"
+      total:         "{{ nodes.1.output.total }}"
+    expression: |
+      {
+        "rows":                $append(closed_rows, skipped),
+        "total":               total,
+        "confirmed_count":     $count(closed_rows[branch = "confirmed"]),
+        "no_contact_count":    $count(closed_rows[branch = "no_contact"]),
+        "skipped_count":       skipped_count,
+        "voice_calls_created": $count(closed_rows[voice_call_ok = true])
+      }
+
+  - id: 4
+    type: response
+    title: Return post-call summary
+    body: "{{ nodes.3.output }}"
+
+edges:
+  - from: 1
+    to: 2
+  - from: 2
+    to: 3
+  - from: 3
+    to: 4

@@ -1,0 +1,37 @@
+name: sf_delete_record
+description: |
+  Delete a Salesforce sObject by Id. Returns 204 No Content on success.
+
+trigger:
+  type: manual
+  input_schema:
+    object:
+      type: string
+      required: true
+    record_id:
+      type: string
+      required: true
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    title: DELETE sobject
+    provider: salesforce
+    method: DELETE
+    endpoint: "/services/data/v59.0/sobjects/{{ input.object }}/{{ input.record_id }}"
+
+  - id: 2
+    type: response
+    title: Shape delete_record response
+    body:
+      http_status: "{{ nodes.1.status }}"
+      deleted: "{{ nodes.1.status }}"
+      record_id: "{{ input.record_id }}"
+
+edges:
+  - from: 1
+    to: 2

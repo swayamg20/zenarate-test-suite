@@ -1,0 +1,63 @@
+name: describe_object
+description: |
+  Describe any Salesforce sObject — returns all fields with name, label,
+  type, referenceTo, and custom flag. Run with input: { "object": "Case" }
+  or any sObject API name.
+
+trigger:
+  type: manual
+  input_schema:
+    object:
+      type: string
+      required: true
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    title: GET sobject describe
+    provider: salesforce
+    method: GET
+    endpoint: "/services/data/v59.0/sobjects/{{ input.object }}/describe"
+
+  - id: 2
+    type: transform
+    title: Extract field summaries
+    input:
+      fields: "{{ nodes.1.body.fields }}"
+      name: "{{ nodes.1.body.name }}"
+      label: "{{ nodes.1.body.label }}"
+    expression: |
+      {
+        "object": name,
+        "label": label,
+        "field_count": $count(fields),
+        "fields": [$map(fields, function($f) {
+          {
+            "name": $f.name,
+            "label": $f.label,
+            "type": $f.type,
+            "custom": $f.custom,
+            "referenceTo": $f.referenceTo,
+            "relationshipName": $f.relationshipName,
+            "picklistValues": $f.type = "picklist" or $f.type = "multipicklist"
+              ? [$map($f.picklistValues, function($p) { $p.value })]
+              : null
+          }
+        })]
+      }
+
+  - id: 3
+    type: response
+    title: Return field map
+    body: "{{ nodes.2.output }}"
+
+edges:
+  - from: 1
+    to: 2
+  - from: 2
+    to: 3

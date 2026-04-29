@@ -1,0 +1,47 @@
+name: get_contact_for_account
+description: |
+  Fetch the first Contact with a phone number for a given AccountId.
+  This is the per-account lookup the agent does after the eligibility
+  gate passes — it gives the dialer a real phone number.
+
+trigger:
+  type: manual
+  input_schema:
+    account_id:
+      type: string
+      required: true
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    # Nango Proxy: GET https://api.nango.dev/proxy/{endpoint}
+    title: Get Contact for Account
+    provider: salesforce
+    method: GET
+    endpoint: /services/data/v59.0/query
+    query:
+      q: |
+        SELECT Id, FirstName, LastName, Phone, Email
+        FROM Contact
+        WHERE AccountId = '{{ input.account_id }}'
+          AND Phone != null
+        LIMIT 1
+
+  - id: 2
+    type: response
+    title: Flatten contact for downstream consumer
+    body:
+      contact_id:    "{{ nodes.1.body.records[0].Id }}"
+      first_name:    "{{ nodes.1.body.records[0].FirstName }}"
+      last_name:     "{{ nodes.1.body.records[0].LastName }}"
+      phone:         "{{ nodes.1.body.records[0].Phone }}"
+      email:         "{{ nodes.1.body.records[0].Email }}"
+
+edges:
+  - from: 1
+    to: 2

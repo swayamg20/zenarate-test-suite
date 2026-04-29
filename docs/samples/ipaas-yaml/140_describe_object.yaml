@@ -1,0 +1,41 @@
+name: sf_describe_object
+description: |
+  Introspect a Salesforce sObject's schema — returns fields, labels, and the
+  ``custom`` flag. Useful before building a SOQL query or field mapping, and
+  critical for Data Mapper / Transform Function authoring.
+
+trigger:
+  type: manual
+  input_schema:
+    object:
+      type: string
+      required: true
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    title: GET sobject describe
+    provider: salesforce
+    method: GET
+    endpoint: "/services/data/v59.0/sobjects/{{ input.object }}/describe"
+
+  - id: 2
+    type: response
+    title: Shape describe_object response
+    body:
+      http_status: "{{ nodes.1.status }}"
+      name: "{{ nodes.1.body.name }}"
+      label: "{{ nodes.1.body.label }}"
+      label_plural: "{{ nodes.1.body.labelPlural }}"
+      custom: "{{ nodes.1.body.custom }}"
+      createable: "{{ nodes.1.body.createable }}"
+      updateable: "{{ nodes.1.body.updateable }}"
+      fields: "{{ nodes.1.body.fields }}"
+
+edges:
+  - from: 1
+    to: 2

@@ -1,0 +1,74 @@
+name: investigate_resort_fields
+description: |
+  Diagnostic atom — investigates which Case field(s) carry the resort
+  name for the GPR ResCon workflow. The pre-call pipeline reads
+  ``Resort_Name__c`` but it returned null for Case 500Su00000cHOPsIAO
+  (Manuel Mcdaniel, Carlsbad Inn Beach Resort) even though the SF UI
+  shows a resort value under "Related GPR Resort".
+
+  Queries multiple Cases and pulls all resort-like fields so we can see
+  which one is populated where.
+
+  Read-only SOQL — no records are created or modified.
+
+trigger:
+  type: manual
+  input_schema: {}
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    title: SOQL — resort fields on both test Cases
+    description: |
+      Pulls every field that could contain the resort name from two
+      known Cases. If Resort_Name__c is null on one but
+      Related_GPR_Resort__c (or similar) is populated, we know which
+      field to use in the 01 SOQL.
+    provider: salesforce
+    method: GET
+    endpoint: /services/data/v59.0/query
+    query:
+      q: |
+        SELECT Id, CaseNumber, Subject,
+               Resort_Name__c,
+               Related_GPR_Resort__c,
+               Related_GPR_Resort__r.Name
+        FROM Case
+        WHERE Id IN (
+          '500Su00000cGeGhIAK',
+          '500Su00000cHOPsIAO'
+        )
+
+  - id: 2
+    type: transform
+    title: Flatten resort fields for comparison
+    input:
+      records: "{{ nodes.1.body.records }}"
+    expression: |
+      [$map(records, function($r) {
+        {
+          "case_number":              $r.CaseNumber,
+          "subject":                  $r.Subject,
+          "Resort_Name__c":           $r.Resort_Name__c,
+          "Related_GPR_Resort__c":    $r.Related_GPR_Resort__c,
+          "Related_GPR_Resort_Name":  $r."Related_GPR_Resort__r" ? $r."Related_GPR_Resort__r"."Name" : null
+        }
+      })]
+
+  - id: 3
+    type: response
+    title: Return resort field comparison
+    body:
+      records: "{{ nodes.2.output }}"
+      total: "{{ nodes.1.body.totalSize }}"
+
+edges:
+  - from: 1
+    to: 2
+  - from: 2
+    to: 3

@@ -1,0 +1,279 @@
+name: all
+description: |
+  End-to-end pre-call pipeline. Inputs nothing.
+
+  Pipeline:
+    01 SOQL query (filters 1..5 enforced at SF)
+      → dedupe by AccountId (group each owner's cases; preserve earliest
+        future check-in as primary)
+      → Phase 1 filter: keep only accounts with count(cases) == 1
+      → loop over single-date accounts
+          ├── fetch contact for account
+          └── shape eligible-callable row
+      → join with primary case context
+      → response
+
+  What changed vs the previous version:
+    * The ``flatten`` node is gone — 01's SOQL response carries flat
+      dicts already (``records[*]`` keyed by field name). The list-view
+      columns-envelope unwrap step is no longer needed.
+    * The 04 subflow call (past-due-sum via Ownership_Interval__c + the
+      active-contract gate) is gone from the production path. The
+      customer's operational eligibility gate lives on Case-level fields
+      (``Total_Amount_Due__c``, plus the RC:ResCon/WUMW/Closed rules),
+      not per-interval summation. 01's SOQL enforces the customer's
+      definition directly. 04 remains in the repo as a drift-detector —
+      if Case.Total_Amount_Due__c ever stops matching
+      sum(Ownership_Interval__c.Total_Amount_Past_Due__c), the 04
+      subflow's audit_all is the single place to look.
+    * Phase 1 single-date filter is new. In this first phase we only
+      handle accounts that have a single open date in the future so
+      that we don't have to handle multiple dates. Phase 2 will replace
+      this with a chronological loop across an owner's future dates.
+
+trigger:
+  type: manual
+  input_schema:
+    # Optional check-in date window. Forwarded into 01's SOQL via the
+    # subflow input below. Defaults live in 01's normalizer node, so
+    # leaving these blank (or omitting them entirely) reproduces the
+    # original ``>= TODAY`` behavior.
+    check_in_start:
+      type: string
+      required: false
+    check_in_end:
+      type: string
+      required: false
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: subflow
+    title: Get open ResCon cases (SOQL)
+    workflow_file: ../01_get_open_cases/workflow.yaml
+    # Forward the optional date window to 01. 01's node-1 normalizer
+    # handles the undefined-or-empty → default fallback, so passing
+    # {{ input.* }} verbatim here is safe even when the caller omits
+    # either key.
+    input:
+      check_in_start: "{{ input.check_in_start }}"
+      check_in_end:   "{{ input.check_in_end }}"
+
+  - id: 2
+    type: transform
+    title: Dedupe cases by AccountId
+    description: |
+      SOQL (01) ORDERs BY AccountId, Waitlist_Check_in_Date__c ASC — so
+      the first row per owner is their earliest future check-in, which
+      we keep as ``primary_case``. The full list of this owner's cases
+      is preserved under ``cases`` so Phase 1 can count them and Phase
+      2 can iterate over them in order.
+    input:
+      rows: "{{ nodes.1.output.records }}"
+    # Outer [] forces array context — JSONata's $reduce over an empty
+    # list returns the accumulator [], but some template resolvers trip
+    # on the mixed-type edge case. Wrapping keeps it uniformly a list.
+    expression: |
+      [$reduce(rows, function($acc, $row) {(
+        $existing := $acc[AccountId = $row.AccountId];
+        $exists($existing)
+          ? $append($acc[AccountId != $row.AccountId], {
+              "AccountId":    $row.AccountId,
+              "account_name": $row."Account"."Name",
+              "primary_case": $existing.primary_case,
+              "cases":        $append($existing.cases, $row)
+            })
+          : $append($acc, {
+              "AccountId":    $row.AccountId,
+              "account_name": $row."Account"."Name",
+              "primary_case": $row,
+              "cases":        [$row]
+            })
+      )}, [])]
+
+  - id: 3
+    type: transform
+    title: Phase 1 — keep accounts with a single future check-in date
+    description: |
+      Phase 1 handles single-date owners only; multi-date owners are
+      deferred to Phase 2.
+
+      Definition of "single date": count of DISTINCT
+      ``Waitlist_Check_in_Date__c`` values across this owner's open
+      cases == 1. We filter on ``$count($distinct(...))`` (not raw
+      ``$count(cases)``) because an owner can legitimately have 2+
+      cases on the SAME check-in date — e.g., one primary reservation
+      plus a linked guest-ticket case — and that's still ONE date to
+      handle. 01's SOQL already restricted to ``>= TODAY`` so every
+      date in the array is a future date by construction.
+
+      Multi-date owners (distinct dates > 1) are NOT silently dropped
+      on purpose; they're surfaced in ``deferred_multi_date`` so the
+      run detail page shows the Phase 2 backlog explicitly. The dial
+      fan-out only uses ``eligible``.
+    input:
+      accounts: "{{ nodes.2.output }}"
+    expression: |
+      {
+        "eligible":             [accounts[$count($distinct(cases.Waitlist_Check_in_Date__c)) = 1]],
+        "deferred_multi_date":  [accounts[$count($distinct(cases.Waitlist_Check_in_Date__c)) > 1]]
+      }
+
+  - id: 4
+    type: loop
+    title: For each eligible account, fetch contact + shape row
+    iterate_over: "{{ nodes.3.output.eligible }}"
+    item_alias: account
+    concurrency: 5
+    body:
+      type: subflow
+      workflow_file: ../_atoms/get_contact_for_account/workflow.yaml
+      input:
+        account_id: "{{ account.AccountId }}"
+    collect:
+      account_id:   "{{ account.AccountId }}"
+      account_name: "{{ account.account_name }}"
+      contact_id:   "{{ subflow.output.contact_id }}"
+      first_name:   "{{ subflow.output.first_name }}"
+      last_name:    "{{ subflow.output.last_name }}"
+      phone:        "{{ subflow.output.phone }}"
+      email:        "{{ subflow.output.email }}"
+
+  - id: 5
+    type: transform
+    title: Join eligible callables with their primary case context
+    description: |
+      Each eligible account has exactly one case (Phase 1 invariant), so
+      we merge that case's fields onto the contact-enriched row produced
+      by the loop. Field names on the left match the downstream
+      ``batch_call.variables`` envelope in ``99_rescon_outbound_scheduled``.
+
+      Person Account fallbacks: the Contact lookup (node 4) may return
+      null fields when the Account is a Person Account with no separate
+      Contact record or no Phone on the Contact. We fall back to
+      Case-level fields (case_cell_phone, case_home_phone, case_work_phone
+      for phone; Person_Account_Email__c for email) and split
+      Account.Name for first/last name.
+    input:
+      eligible_callables: "{{ nodes.4.output }}"
+      phase1_eligible:    "{{ nodes.3.output.eligible }}"
+    # Outer [] — same array-context guard as node 2.
+    expression: |
+      (
+        /* Strip phone extensions (x, ext, #), non-digit chars, and normalize
+           to E.164. US 10-digit numbers get +1 prefix. Numbers already in
+           E.164 (+...) pass through. Returns null for empty input.
+           "874-423-9064x3109" → "+18744239064"
+           "530-680-3341"      → "+15306803341"
+           "+917732924082"     → "+917732924082" (non-US, already E.164) */
+        $clean_phone := function($raw) {(
+          $stripped := $raw ? $replace($raw, /[xX#].*$/, "") : null;
+          $digits := $stripped ? $replace($stripped, /[^\d+]/, "") : null;
+          $digits = null or $digits = "" ? null
+            : $substring($digits, 0, 1) = "+" ? $digits
+            : $length($digits) = 10 ? "+1" & $digits
+            : $length($digits) = 11 and $substring($digits, 0, 1) = "1" ? "+" & $digits
+            : "+" & $digits
+        )};
+
+        /* First non-null cleaned phone from the priority list.
+           Order: Case Home → Case Cell → Case Work → Account Phone → Account Mobile. */
+        $pick_phone := function($phones) {(
+          $cleaned := $map($phones, $clean_phone);
+          $reduce($cleaned, function($acc, $p) {
+            $acc ? $acc : ($p and $p != "" ? $p : null)
+          }, null)
+        )};
+
+        [$map(eligible_callables, function($e) {(
+          $acct := phase1_eligible[AccountId = $e.account_id];
+          $case := $acct.primary_case;
+          $res_type := $case."SPI_Reservation__r" ? $case."SPI_Reservation__r"."Reservation_Type__c" : null;
+          $owner_type := $case.Account_Owner_Type__c;
+          $name_parts := $split($e.account_name, " ");
+          $resolved_phone := $pick_phone([
+            $case.Case_Home_Phone__c,
+            $case.Case_Cell_Phone__c,
+            $case.Case_Work_Phone__c,
+            $e.phone,
+            $case."Account"."Phone",
+            $case."Account"."PersonMobilePhone"
+          ]);
+          $merge([$e, {
+            "case_id":         $case.Id,
+            "case_number":     $case.CaseNumber,
+            "subject":         $case.Subject,
+            "city":            $case.City__c,
+            "check_in_date":   $case.Waitlist_Check_in_Date__c,
+            "check_out_date":  $case.WaitList_Check_Out_Date__c,
+            "resort":          $case."Related_GPR_Resort__r" ? $case."Related_GPR_Resort__r"."Name" : $case.Resort_Name__c,
+            "contract_id":     $case.Certificate_Number__c,
+            "sum_past_due":    $case.Total_Amount_Due__c,
+            "case_home_phone": $case.Case_Home_Phone__c,
+            "case_cell_phone": $case.Case_Cell_Phone__c,
+            "case_work_phone": $case.Case_Work_Phone__c,
+            "case_email":      $case.Person_Account_Email__c,
+            "first_name":      $e.first_name ? $e.first_name : $name_parts[0],
+            "last_name":       $e.last_name ? $e.last_name : ($count($name_parts) > 1 ? $join($filter($name_parts, function($v, $i) { $i > 0 }), " ") : ""),
+            "phone":           $resolved_phone,
+            "email":           $e.email ? $e.email : $case.Person_Account_Email__c,
+            "account_owner_type": $owner_type,
+            "reservation_type": $res_type,
+            "customer_type":   $res_type = "Owner"   ? "owner"
+                             : $res_type = "Exchange" ? "exchanger"
+                             : $res_type = "Walk-In"  ? "guest"
+                             :                          "owner"
+          }])
+        )})]
+      )
+
+  - id: 6
+    type: transform
+    title: Compute Phase 1 summary counts
+    description: |
+      JSONata ``$count`` aggregates live here (not in node 7's response
+      body), because the response node's ``{{ }}`` template engine is
+      string-interpolation only — it doesn't evaluate JSONata function
+      calls. Computing the counts in a transform lets node 7 just
+      reference ``nodes.6.output.*`` literals.
+    input:
+      records:  "{{ nodes.1.output.records }}"
+      deduped:  "{{ nodes.2.output }}"
+      eligible: "{{ nodes.3.output.eligible }}"
+      deferred: "{{ nodes.3.output.deferred_multi_date }}"
+    expression: |
+      {
+        "total_soql_matches":  $count(records),
+        "distinct_accounts":   $count(deduped),
+        "phase1_eligible":     $count(eligible),
+        "deferred_multi_date": $count(deferred)
+      }
+
+  - id: 7
+    type: response
+    title: Return eligible callables (+ Phase 2 backlog)
+    body:
+      # Primary output — the dialable rows fed to batch_call.
+      callables: "{{ nodes.5.output }}"
+      # Visibility into the Phase 1 gate (precomputed in node 6).
+      counts: "{{ nodes.6.output }}"
+      # Surface (not dial) the multi-date backlog so ops can see Phase 2 demand.
+      deferred_multi_date: "{{ nodes.3.output.deferred_multi_date }}"
+
+edges:
+  - from: 1
+    to: 2
+  - from: 2
+    to: 3
+  - from: 3
+    to: 4
+  - from: 4
+    to: 5
+  - from: 5
+    to: 6
+  - from: 6
+    to: 7

@@ -1,0 +1,40 @@
+name: sf_create_record
+description: |
+  Create a Salesforce sObject via POST /sobjects/{object}. Generic over
+  object type; caller supplies the object API name and a field map.
+
+trigger:
+  type: manual
+  input_schema:
+    object:
+      type: string
+      required: true
+    fields:
+      type: object
+      required: true
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    title: POST sobject
+    provider: salesforce
+    method: POST
+    endpoint: "/services/data/v59.0/sobjects/{{ input.object }}"
+    body: "{{ input.fields }}"
+
+  - id: 2
+    type: response
+    title: Shape create_record response
+    body:
+      http_status: "{{ nodes.1.status }}"
+      id: "{{ nodes.1.body.id }}"
+      success: "{{ nodes.1.body.success }}"
+      errors: "{{ nodes.1.body.errors }}"
+
+edges:
+  - from: 1
+    to: 2

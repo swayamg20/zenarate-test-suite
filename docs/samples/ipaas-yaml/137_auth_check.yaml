@@ -1,0 +1,32 @@
+name: sf_auth_check
+description: |
+  Verify a Salesforce connection is live by calling /services/data/, which
+  returns the list of supported API versions. Any 2xx response means the
+  Nango connection is authenticated.
+
+trigger:
+  type: manual
+  input_schema: {}
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    title: Ping Salesforce data root
+    provider: salesforce
+    method: GET
+    endpoint: /services/data/
+
+  - id: 2
+    type: response
+    title: Shape auth_check response
+    body:
+      authenticated: "{{ nodes.1.status }}"
+      versions: "{{ nodes.1.body }}"
+
+edges:
+  - from: 1
+    to: 2

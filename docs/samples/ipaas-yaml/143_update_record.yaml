@@ -1,0 +1,42 @@
+name: sf_update_record
+description: |
+  Update an existing Salesforce sObject via PATCH. Salesforce returns 204
+  No Content on success — the atom surfaces that status directly.
+
+trigger:
+  type: manual
+  input_schema:
+    object:
+      type: string
+      required: true
+    record_id:
+      type: string
+      required: true
+    fields:
+      type: object
+      required: true
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    title: PATCH sobject
+    provider: salesforce
+    method: PATCH
+    endpoint: "/services/data/v59.0/sobjects/{{ input.object }}/{{ input.record_id }}"
+    body: "{{ input.fields }}"
+
+  - id: 2
+    type: response
+    title: Shape update_record response
+    body:
+      http_status: "{{ nodes.1.status }}"
+      updated: "{{ nodes.1.status }}"
+      record_id: "{{ input.record_id }}"
+
+edges:
+  - from: 1
+    to: 2

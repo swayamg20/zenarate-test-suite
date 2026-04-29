@@ -1,0 +1,38 @@
+name: sf_get_record_by_id
+description: |
+  Fetch a single Salesforce sObject by its 15- or 18-char Id. Generic over
+  object type (Account, Contact, Case, ...) — the caller specifies both the
+  object API name and the record id via trigger input.
+
+trigger:
+  type: manual
+  input_schema:
+    object:
+      type: string
+      required: true
+    record_id:
+      type: string
+      required: true
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+
+nodes:
+  - id: 1
+    type: nango_proxy
+    title: GET sobject by id
+    provider: salesforce
+    method: GET
+    endpoint: "/services/data/v59.0/sobjects/{{ input.object }}/{{ input.record_id }}"
+
+  - id: 2
+    type: response
+    title: Shape get_record_by_id response
+    body:
+      http_status: "{{ nodes.1.status }}"
+      record: "{{ nodes.1.body }}"
+
+edges:
+  - from: 1
+    to: 2

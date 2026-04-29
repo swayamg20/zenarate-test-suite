@@ -1,0 +1,120 @@
+name: get_eligible_accounts
+description: |
+  Given a list of Person Account Ids, return the subset that is callable
+  per the eligibility predicate.
+
+  Predicate (production-safe default):
+    eligible :=
+        (interval_count > 0)                            # cannot verify zero records
+        AND (SUM(Total_Amount_Past_Due__c) <= 50)       # Scribe gate
+        AND (require_active_contract = false
+             OR any active Contract_Status__c)          # ignore cancelled contracts
+
+  The active-contract clause is parameterized via `require_active_contract`
+  (default: true → strict). Callers that need a relaxed gate (e.g. the
+  05_pre_call_all sandbox fan-out) pass `false` at the call site. Making it an input
+  keeps this subflow as the single source of truth for eligibility rules —
+  no duplicated logic, no bespoke `overrides` mechanism.
+
+  This is the gate test in isolation — no list view, no contact lookup,
+  no case context. Just "given these accounts, who passes the gate?"
+
+trigger:
+  type: manual
+  input_schema:
+    account_ids:
+      type: array
+      items: string
+      required: true
+    require_active_contract:
+      type: boolean
+      default: true
+      required: false
+
+constants:
+  past_due_threshold_usd: 50
+  active_contract_status: "Active"
+
+connections:
+  salesforce:
+    provider_config_key: salesforce
+    connection_id: 70959a87-160b-439b-967f-aa0146c4b112
+
+nodes:
+  - id: 1
+    type: subflow
+    title: Fetch ownership intervals
+    workflow_file: ../03_get_ownership_intervals/workflow.yaml
+    input:
+      account_ids: "{{ input.account_ids }}"
+
+  - id: 2
+    type: transform
+    title: Group intervals by account, compute eligibility
+    description: |
+      Roll up intervals per Property_Owner__c, compute eligibility:
+        - interval_count: number of intervals returned for this account
+        - sum_past_due: SUM(Total_Amount_Past_Due__c) across all intervals
+        - has_active_contract: at least one Contract_Status__c == "Active"
+        - eligible: interval_count > 0
+                    AND sum_past_due <= 50
+                    AND (require_active_contract = false OR has_active_contract)
+
+      Accounts with zero intervals (Anna case) get a synthetic row with
+      interval_count=0 and eligible=false so the result is symmetric across
+      all input accounts.
+
+      `require_active_contract` is passed through from the trigger input so
+      the predicate is fully parameterized at the call site. Absent/true →
+      enforced (production-safe); only the explicit boolean `false` relaxes
+      the gate.
+    input:
+      requested_ids: "{{ input.account_ids }}"
+      intervals: "{{ nodes.1.output.records }}"
+      require_active_contract: "{{ input.require_active_contract }}"
+    # Outer [] forces array context — $map over an empty input collapses to
+    # undefined (→ None) in JSONata-Python, which breaks downstream consumers
+    # that expect a list. `[$map(...)]` normalizes to a 0/1/N-length array.
+    expression: |
+      [$map(requested_ids, function($acc_id) {(
+        $own_intervals := intervals[Property_Owner__c = $acc_id];
+        {
+          "account_id":          $acc_id,
+          "interval_count":      $count($own_intervals),
+          "sum_past_due":        $sum($own_intervals.Total_Amount_Past_Due__c),
+          "has_active_contract": $exists($own_intervals[Contract_Status__c = constants.active_contract_status]),
+          "delinquent_any":      $exists($own_intervals[Delinquent__c = "Yes"]),
+          "max_days_past_due":   $max($own_intervals.Days_Past_Due__c),
+          "eligible":            $count($own_intervals) > 0
+                                  and $sum($own_intervals.Total_Amount_Past_Due__c) <= constants.past_due_threshold_usd
+                                  and (require_active_contract = false
+                                       ? true
+                                       : $exists($own_intervals[Contract_Status__c = constants.active_contract_status]))
+        }
+      )})]
+
+  - id: 3
+    type: transform
+    title: Filter to eligible only
+    input:
+      rows: "{{ nodes.2.output }}"
+    # Outer [] forces array context — JSONata's filter returns `undefined`
+    # (→ Python None) for zero matches and a scalar for a single match, which
+    # breaks downstream consumers that expect a list (notably 05_pre_call_all's
+    # `loop.iterate_over`). `[expr]` coerces to a length-0/1/N array uniformly.
+    expression: "[rows[eligible = true]]"
+
+  - id: 4
+    type: response
+    title: Return eligible accounts + audit fields
+    body:
+      eligible: "{{ nodes.3.output }}"
+      audit_all: "{{ nodes.2.output }}"
+
+edges:
+  - from: 1
+    to: 2
+  - from: 2
+    to: 3
+  - from: 3
+    to: 4
