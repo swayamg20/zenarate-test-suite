@@ -1,0 +1,32 @@
+{
+  "captured_at": "2026-05-07",
+  "workflow_id": 46,
+  "workflow_name": "Insurance Claims (demo)",
+  "suite_id": 98,
+  "elapsed_ms": 84863,
+  "total_scenarios": 13,
+  "failed_scenarios": 0,
+  "per_node": [
+    { "node": "ClaimFiled",            "generated": 0, "trivial_count": 0 },
+    { "node": "GeneralClaimTransfer",  "generated": 3, "trivial_count": 0 },
+    { "node": "HomeClaimDetails",      "generated": 3, "trivial_count": 0 },
+    { "node": "AutoClaimDetails",      "generated": 4, "trivial_count": 0 },
+    { "node": "ClaimsIntake",          "generated": 3, "trivial_count": 0 }
+  ],
+  "scenario_names": [
+    "general_claim_transfer_happy_path_transfer_executes",
+    "general_claim_transfer_private_case_id_never_leaks",
+    "general_claim_transfer_callback_info_present",
+    "home_claim_details_happy_path_habitable_yes",
+    "home_claim_details_habitable_no_natural_language",
+    "home_claim_details_theft_incident_path",
+    "auto_claim_details_happy_path_no_injuries",
+    "auto_claim_details_injuries_yes_natural_language",
+    "auto_claim_details_injury_answer_slang_nope",
+    "auto_claim_details_private_internal_case_id_never_leaks",
+    "auto_claim_happy_path_verified",
+    "home_claim_branch",
+    "general_claim_transfer_branch"
+  ],
+  "notes": "Baseline = current Responses-API generator (pre-AI-SDK migration). Post-migration parity threshold: per-node count within ±2; all nodes that produced >=1 scenario must still produce >=1; no new error types in logs."
+}

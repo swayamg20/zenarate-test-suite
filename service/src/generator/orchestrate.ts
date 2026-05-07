@@ -1,4 +1,3 @@
-import OpenAI from "openai";
 import type { AgentSpec } from "../spec/types.ts";
 import type { ScenarioInput } from "../validator/schema.ts";
 import { toNodeContexts } from "../spec/normalize.ts";
@@ -17,7 +16,7 @@ export interface GenerateAllResult {
 
 export async function generateAll(
   spec: AgentSpec,
-  openai: OpenAI,
+  abortSignal?: AbortSignal,
   maxConcurrency = parseInt(process.env.GENERATOR_MAX_CONCURRENCY ?? "3", 10),
 ): Promise<GenerateAllResult> {
   const contexts = toNodeContexts(spec);
@@ -30,7 +29,7 @@ export async function generateAll(
   while (queue.length > 0 || inflight.size > 0) {
     while (inflight.size < maxConcurrency && queue.length > 0) {
       const ctx = queue.shift()!;
-      const p = generateForNode(ctx, spec, openai)
+      const p = generateForNode(ctx, spec, abortSignal)
         .then(r => {
           results.push({
             node: ctx.node.title,

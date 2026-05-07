@@ -1,7 +1,6 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import "dotenv/config";
-import OpenAI from "openai";
 
 import { clientFromEnv } from "../zenarate/factory.ts";
 import { loadWorkflow } from "../spec/load.ts";
@@ -27,7 +26,6 @@ app.post("/agents/:wfId/generate-suite", async (c) => {
     log({ step: "start", wf_id: wfId, dry_run: dryRun });
 
     const client = await clientFromEnv();
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
     log({ step: "load", wf_id: wfId });
     const raw = await loadWorkflow(client, wfId);
@@ -36,7 +34,7 @@ app.post("/agents/:wfId/generate-suite", async (c) => {
     const spec = normalize(raw);
 
     log({ step: "generate" });
-    const { perNode, allScenarios } = await generateAll(spec, openai);
+    const { perNode, allScenarios } = await generateAll(spec, c.req.raw.signal);
 
     if (dryRun) {
       log({ step: "done", dry_run: true, total_ms: Date.now() - t0 });

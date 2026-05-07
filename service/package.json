@@ -8,13 +8,14 @@
     "dev": "tsx watch src/http/server.ts",
     "start": "tsx src/http/server.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/"
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
+    "@ai-sdk/openai": "^2.0.0",
     "@hono/node-server": "^1.13.0",
+    "ai": "^5.0.0",
     "dotenv": "^16.4.5",
     "hono": "^4.6.0",
-    "openai": "^4.65.0",
     "zenlabs-web-typescript": "file:../../../../Downloads/zenlabs-sdk-master/web/typescript",
     "zod": "^3.23.8"
   },
