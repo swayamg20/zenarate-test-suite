@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import Module, { createRequire } from "node:module";
 import test from "node:test";
 
-import type { LanguageModelV2Content } from "@ai-sdk/provider";
+import type {
+  LanguageModelV2CallOptions,
+  LanguageModelV2Content,
+} from "@ai-sdk/provider";
 
 import { generateForNode } from "../src/generator/agent.ts";
 import type { AgentSpec, NodeContext, SpecNode } from "../src/spec/types.ts";
@@ -121,6 +124,16 @@ const validScenario = (name = "captures_first_name"): ScenarioInput => ({
   },
 });
 
+const invalidVariableScenario = (name = "needs_repair"): ScenarioInput => ({
+  ...validScenario(name),
+  turns: [{ text: "My name is Sam.", expected_replies: 1 }],
+  assertions: {
+    min_responses: 1,
+    extracted_variables: { last_name: "Sam" },
+    variable_types: { first_name: "str" },
+  },
+});
+
 function toolCall(
   toolCallId: string,
   toolName: string,
@@ -134,11 +147,15 @@ function toolCall(
   };
 }
 
-function mockModelForSteps(steps: LanguageModelV2Content[][]) {
+function mockModelForSteps(
+  steps: LanguageModelV2Content[][],
+  onGenerate?: (options: LanguageModelV2CallOptions, callIndex: number) => void,
+) {
   let index = 0;
 
   return new MockLanguageModelV2({
-    doGenerate: async () => {
+    doGenerate: async (options) => {
+      onGenerate?.(options, index);
       const content = steps[index] ?? [];
       index += 1;
 
@@ -282,4 +299,166 @@ test("generateForNode drops unvalidated scenarios on finalize", async () => {
   assert.equal(result.scenarios.length, 0);
   assert.equal(droppedEvents.length > 0, true);
   assert.deepEqual(droppedEvents[0]?.dropped, ["captures_first_name"]);
+});
+
+test("generateForNode prevents back-to-back propose_scenario via prepareStep", async () => {
+  const toolNamesByCall: string[][] = [];
+
+  await captureLogs(async () => {
+    try {
+      await generateForNode(
+        ctx,
+        spec,
+        undefined,
+        mockModelForSteps(
+          [
+            [toolCall("call-1", "propose_scenario", { scenario: validScenario() })],
+            [
+              toolCall("call-2", "propose_scenario", {
+                scenario: validScenario("second_proposal"),
+              }),
+            ],
+          ],
+          (options) => {
+            toolNamesByCall.push(
+              options.tools
+                ?.filter((tool) => tool.type === "function")
+                .map((tool) => tool.name) ?? [],
+            );
+          },
+        ),
+      );
+    } catch {
+      // The scripted model intentionally calls an unavailable tool on step 2.
+    }
+  });
+
+  assert.equal(toolNamesByCall.length >= 2, true);
+  assert.equal(toolNamesByCall[0]?.includes("propose_scenario"), true);
+  assert.equal(toolNamesByCall[1]?.includes("propose_scenario"), false);
+  assert.deepEqual([...(toolNamesByCall[1] ?? [])].sort(), [
+    "finalize",
+    "list_proposed",
+    "remove_scenario",
+    "validate_scenario",
+  ]);
+});
+
+test("generateForNode repairs an invalid scenario via generateObject and accepts it", async () => {
+  const modelInputs: string[] = [];
+  let repairCalls = 0;
+  const repairedScenario: ScenarioInput = {
+    ...validScenario("needs_repair"),
+    turns: [{ text: "My name is Riley.", expected_replies: 1 }],
+    assertions: {
+      min_responses: 1,
+      extracted_variables: { first_name: "Riley" },
+      variable_types: { first_name: "str" },
+    },
+  };
+
+  const { result, logs } = await captureLogs(() =>
+    generateForNode(
+      ctx,
+      spec,
+      undefined,
+      mockModelForSteps(
+        [
+          [
+            toolCall("call-1", "propose_scenario", {
+              scenario: invalidVariableScenario(),
+            }),
+          ],
+          [toolCall("call-2", "validate_scenario", { index: 0 })],
+          [toolCall("call-3", "finalize", {})],
+        ],
+        (options) => {
+          modelInputs.push(JSON.stringify(options.prompt));
+        },
+      ),
+      async (scenario, errors) => {
+        repairCalls += 1;
+        assert.equal(scenario.name, "needs_repair");
+        assert.equal(
+          scenario.assertions?.extracted_variables?.last_name,
+          "Sam",
+        );
+        assert.equal(
+          errors.some((error) => error.includes("last_name")),
+          true,
+        );
+        return repairedScenario;
+      },
+    ),
+  );
+
+  const events = logEvents(logs);
+  const validateResponseSeenByModel = modelInputs[2] ?? "";
+
+  assert.equal(repairCalls, 1);
+  assert.equal(validateResponseSeenByModel.includes('"repaired":true'), true);
+  assert.equal(result.scenarios.length, 1);
+  assert.equal(
+    result.scenarios[0]?.assertions?.extracted_variables?.first_name,
+    "Riley",
+  );
+  assert.equal(
+    result.scenarios[0]?.assertions?.extracted_variables?.last_name,
+    undefined,
+  );
+  assert.equal(
+    events.some((entry) => entry.event === "validation_repaired"),
+    true,
+  );
+});
+
+test("generateForNode reports repair_failed when generateObject still fails validation", async () => {
+  const modelInputs: string[] = [];
+  let repairCalls = 0;
+
+  const { result, logs } = await captureLogs(() =>
+    generateForNode(
+      ctx,
+      spec,
+      undefined,
+      mockModelForSteps(
+        [
+          [
+            toolCall("call-1", "propose_scenario", {
+              scenario: invalidVariableScenario(),
+            }),
+          ],
+          [toolCall("call-2", "validate_scenario", { index: 0 })],
+          [toolCall("call-3", "list_proposed", {})],
+          [toolCall("call-4", "finalize", {})],
+        ],
+        (options) => {
+          modelInputs.push(JSON.stringify(options.prompt));
+        },
+      ),
+      async () => {
+        repairCalls += 1;
+        return {
+          ...invalidVariableScenario(),
+          turns: [{ text: "My name is Riley.", expected_replies: 1 }],
+        };
+      },
+    ),
+  );
+
+  const events = logEvents(logs);
+  const validateResponseSeenByModel = modelInputs[2] ?? "";
+  const listResponseSeenByModel = modelInputs[3] ?? "";
+
+  assert.equal(repairCalls, 1);
+  assert.equal(validateResponseSeenByModel.includes('"repair_failed":true'), true);
+  assert.equal(validateResponseSeenByModel.includes('"repair_attempted":true'), true);
+  assert.equal(result.scenarios.length, 0);
+  assert.equal(listResponseSeenByModel.includes('"name":"needs_repair"'), true);
+  assert.equal(listResponseSeenByModel.includes('"validated":false'), true);
+  assert.equal(listResponseSeenByModel.includes('"last_name"'), true);
+  assert.equal(
+    events.some((entry) => entry.event === "validation_repair_failed"),
+    true,
+  );
 });

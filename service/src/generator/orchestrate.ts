@@ -1,5 +1,7 @@
 import type { AgentSpec } from "../spec/types.ts";
 import type { ScenarioInput } from "../validator/schema.ts";
+import type { CoverageReport } from "../coverage/index.ts";
+import { computeCoverage } from "../coverage/index.ts";
 import { toNodeContexts } from "../spec/normalize.ts";
 import { generateForNode } from "./agent.ts";
 
@@ -12,6 +14,7 @@ export interface PerNodeResult {
 export interface GenerateAllResult {
   perNode: PerNodeResult[];
   allScenarios: ScenarioInput[];
+  coverage: CoverageReport;
 }
 
 export async function generateAll(
@@ -57,5 +60,6 @@ export async function generateAll(
   }
 
   const allScenarios = results.flatMap(r => r.scenarios);
-  return { perNode: results, allScenarios };
+  const coverage = computeCoverage(spec, allScenarios);
+  return { perNode: results, allScenarios, coverage };
 }

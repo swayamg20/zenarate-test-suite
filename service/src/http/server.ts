@@ -34,11 +34,11 @@ app.post("/agents/:wfId/generate-suite", async (c) => {
     const spec = normalize(raw);
 
     log({ step: "generate" });
-    const { perNode, allScenarios } = await generateAll(spec, c.req.raw.signal);
+    const { perNode, allScenarios, coverage } = await generateAll(spec, c.req.raw.signal);
 
     if (dryRun) {
       log({ step: "done", dry_run: true, total_ms: Date.now() - t0 });
-      return c.json({ dry_run: true, spec, perNode, scenarios: allScenarios });
+      return c.json({ dry_run: true, spec, perNode, scenarios: allScenarios, coverage });
     }
 
     log({ step: "publish", count: allScenarios.length });
@@ -55,6 +55,7 @@ app.post("/agents/:wfId/generate-suite", async (c) => {
         generated: r.scenarios.length,
         trivial_count: r.trivial_count,
       })),
+      coverage,
       elapsed_ms: Date.now() - t0,
     });
   } catch (e: any) {

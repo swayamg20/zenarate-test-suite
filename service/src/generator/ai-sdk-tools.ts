@@ -1,8 +1,32 @@
-import { tool } from "ai";
+import { generateObject, tool } from "ai";
+import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
 
 import { ScenarioSchema } from "../validator/schema.ts";
-import type { GeneratorToolset } from "./tools.ts";
+import type { ScenarioInput } from "../validator/schema.ts";
+import type { GeneratorToolset, ScenarioRepair } from "./tools.ts";
+
+export function createScenarioRepair(): ScenarioRepair {
+  return async (scenario: ScenarioInput, errors: string[]) => {
+    const result = await generateObject({
+      model: openai.responses(
+        process.env.OPENAI_REPAIR_MODEL ??
+          process.env.OPENAI_MODEL ??
+          "gpt-5.2",
+      ),
+      schema: ScenarioSchema,
+      system:
+        "You will receive a scenario that failed validation. Fix the listed errors. Return ONLY the repaired scenario, schema-valid.",
+      prompt:
+        "Fix this scenario:\n" +
+        JSON.stringify(scenario, null, 2) +
+        "\n\nValidation errors:\n" +
+        errors.join("\n"),
+    });
+
+    return result.object;
+  };
+}
 
 export function createGeneratorTools(toolset: GeneratorToolset) {
   return {
@@ -18,7 +42,7 @@ export function createGeneratorTools(toolset: GeneratorToolset) {
       description:
         "Run schema, consistency, and triviality checks on a staged scenario.",
       inputSchema: z.object({ index: z.number().int().min(0) }),
-      execute: async (args) => toolset.validate_scenario(args),
+      execute: async (args) => await toolset.validate_scenario(args),
     }),
 
     list_proposed: tool({

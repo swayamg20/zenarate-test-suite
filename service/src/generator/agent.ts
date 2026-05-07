@@ -5,7 +5,8 @@ import type { NodeContext, AgentSpec } from "../spec/types.ts";
 import type { ScenarioInput } from "../validator/schema.ts";
 import { isTrivial } from "../validator/triviality.ts";
 import { GeneratorToolset } from "./tools.ts";
-import { createGeneratorTools } from "./ai-sdk-tools.ts";
+import type { ScenarioRepair } from "./tools.ts";
+import { createGeneratorTools, createScenarioRepair } from "./ai-sdk-tools.ts";
 import { SYSTEM_PROMPT, FEW_SHOT_EXEMPLARS } from "./prompt.ts";
 
 export interface GenerateForNodeResult {
@@ -22,11 +23,12 @@ export async function generateForNode(
   spec: AgentSpec,
   abortSignal?: AbortSignal,
   model?: LanguageModel,
+  repair?: ScenarioRepair,
 ): Promise<GenerateForNodeResult> {
   const node = ctx.node.title;
   log({ event: "node_start", node, outgoing: ctx.outgoing.length });
 
-  const toolset = new GeneratorToolset(ctx, spec);
+  const toolset = new GeneratorToolset(ctx, spec, repair ?? createScenarioRepair());
 
   const systemPrompt =
     SYSTEM_PROMPT +
@@ -48,6 +50,20 @@ export async function generateForNode(
     prompt: userMessage,
     tools: createGeneratorTools(toolset),
     stopWhen: [hasToolCall("finalize"), stepCountIs(12)],
+    prepareStep: ({ steps }) => {
+      // After proposing, force a validate/remove/list/finalize step before proposing again.
+      if (steps.at(-1)?.toolCalls.some((call) => call.toolName === "propose_scenario")) {
+        return {
+          activeTools: [
+            "validate_scenario",
+            "remove_scenario",
+            "list_proposed",
+            "finalize",
+          ],
+        };
+      }
+      return undefined;
+    },
     abortSignal,
     experimental_telemetry: { isEnabled: true, functionId: "generateForNode" },
     experimental_repairToolCall: async ({ toolCall, error }) => {

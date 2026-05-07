@@ -12,6 +12,21 @@ export interface StagedScenario {
   validation_errors: string[];
 }
 
+export type ScenarioRepair = (
+  scenario: ScenarioInput,
+  errors: string[],
+) => Promise<ScenarioInput>;
+
+export type ValidateScenarioResult =
+  | { ok: true; repaired?: boolean; errors_fixed?: string[] }
+  | {
+      ok: false;
+      errors: string[];
+      repair_attempted?: boolean;
+      repair_failed?: boolean;
+      repair_failed_errors?: string[];
+    };
+
 export class GeneratorToolset {
   private staged: StagedScenario[] = [];
   private _finalized = false;
@@ -19,6 +34,7 @@ export class GeneratorToolset {
   constructor(
     private ctx: NodeContext,
     private spec: AgentSpec,
+    private repair?: ScenarioRepair,
   ) {}
 
   /**
@@ -55,24 +71,80 @@ export class GeneratorToolset {
     return { index: idx };
   }
 
-  validate_scenario(args: { index: number }): { ok: true } | { ok: false; errors: string[] } {
+  async validate_scenario(args: { index: number }): Promise<ValidateScenarioResult> {
     const slot = this.staged[args.index];
     if (!slot) return { ok: false, errors: [`no scenario at index ${args.index}`] };
     const r = validate(slot.scenario, this.ctx, this.spec);
     slot.validated = r.ok;
     slot.validation_errors = r.errors;
 
-    if (!r.ok) {
+    if (r.ok) return { ok: true };
+
+    log({
+      event: "validation_failed",
+      node: this.ctx.node.title,
+      name: slot.scenario.name,
+      index: args.index,
+      errors: r.errors,
+    });
+
+    if (!this.repair) return { ok: false, errors: r.errors };
+
+    try {
+      const repaired = await this.repair(slot.scenario, r.errors);
+      const repairedResult = validate(repaired, this.ctx, this.spec);
+
+      if (repairedResult.ok) {
+        slot.scenario = repaired;
+        slot.validated = true;
+        slot.validation_errors = [];
+        log({
+          event: "validation_repaired",
+          node: this.ctx.node.title,
+          name: slot.scenario.name,
+          index: args.index,
+          errors_fixed: r.errors,
+        });
+        return { ok: true, repaired: true, errors_fixed: r.errors };
+      }
+
+      slot.validated = false;
+      slot.validation_errors = r.errors;
       log({
-        event: "validation_failed",
+        event: "validation_repair_failed",
         node: this.ctx.node.title,
         name: slot.scenario.name,
         index: args.index,
         errors: r.errors,
+        repair_failed_errors: repairedResult.errors,
       });
+      return {
+        ok: false,
+        errors: r.errors,
+        repair_attempted: true,
+        repair_failed: true,
+        repair_failed_errors: repairedResult.errors,
+      };
+    } catch (error) {
+      slot.validated = false;
+      slot.validation_errors = r.errors;
+      const repairFailedErrors = [String(error)];
+      log({
+        event: "validation_repair_failed",
+        node: this.ctx.node.title,
+        name: slot.scenario.name,
+        index: args.index,
+        errors: r.errors,
+        repair_failed_errors: repairFailedErrors,
+      });
+      return {
+        ok: false,
+        errors: r.errors,
+        repair_attempted: true,
+        repair_failed: true,
+        repair_failed_errors: repairFailedErrors,
+      };
     }
-
-    return r.ok ? { ok: true } : { ok: false, errors: r.errors };
   }
 
   /**
