@@ -2,7 +2,7 @@
 
 Automatic test suite generation for voice agents. Point it at any agent, get a complete test suite back — scenarios, assertions, conversation flows, all published and ready to run.
 
-Built for the [Zenarate](https://zenarate-prod.vercel.app) voice agent platform. Uses the ZenLabs SDK for all platform operations and an LLM agent (OpenAI Responses API) to reason about what to test.
+Built for the [Zenarate](https://zenarate-prod.vercel.app) voice agent platform. Uses the ZenLabs SDK for all platform operations and an LLM agent (Vercel AI SDK over the OpenAI Responses API) to reason about what to test.
 
 ---
 
@@ -148,6 +148,50 @@ The Insurance Claims workflow was created programmatically via the SDK (`scripts
 
 ---
 
+## Tests & verification
+
+```bash
+cd service
+npm run typecheck   # tsc --noEmit, clean
+npm test            # 14/14 passing
+```
+
+| Suite | Cases | Coverage |
+|---|---:|---|
+| `test/generator.test.ts` | 7 | Agent loop wiring via `MockLanguageModelV2` from `ai/test`. Happy path, step-cap force-finalize, malformed-args repair, finalize-without-validate drop, `prepareStep` validate-after-propose enforcement, validator-side `generateObject` repair (success + failure). |
+| `test/coverage.test.ts` | 7 | `computeCoverage` against synthetic 3-node specs. Partial / full node coverage, edge coverage including target-node arrival heuristic, branching, writable-variable coverage, assertion-type union, best-effort read coverage. |
+
+### Live parity check (Vercel AI SDK migration)
+
+Captured the **pre-migration** generator's response on demo workflow #46 as a baseline, then ran the **post-migration** code against the same workflow. Goal: prove the SDK rewrite preserves behavior.
+
+| Node | Baseline (Responses API loop) | Post-migration (`generateText`) | Δ |
+|------|---:|---:|---:|
+| ClaimFiled | 0 | 0 | 0 |
+| GeneralClaimTransfer | 3 | 3 | 0 |
+| HomeClaimDetails | 3 | 3 | 0 |
+| AutoClaimDetails | 4 | 4 | 0 |
+| ClaimsIntake | 3 | 3 | 0 |
+| **Total** | **13** | **13** | **0** |
+
+Threshold was ±2 per node (LLM is non-deterministic at temp 0.3); actual Δ came out exact. A second post-migration run produced 14, well within variance. `failed_scenarios = 0` in both runs. Snapshots and the full report at [`service/test/__snapshots__/parity-report.md`](service/test/__snapshots__/parity-report.md).
+
+### Coverage report on demo #46 (live)
+
+Sampled from a real `dry_run=true` against the demo, **after** the AI SDK migration and follow-on enhancements:
+
+| Dimension | Coverage | Notes |
+|---|---|---|
+| Nodes | 4/5 (80%) | `ClaimFiled` (terminal end node) unreached |
+| Edges | 3/5 (60%) | Missing: `HomeClaimDetails→ClaimFiled`, `AutoClaimDetails→ClaimFiled` |
+| Branches | 3/3 (100%) | All 3 conditional branches at `ClaimsIntake` exercised |
+| Variables (write) | 14/14 (100%) | — |
+| Assertion types used | 9 distinct | `tts_say`, `extracted_variables`, `variable_types`, `excluded_variables`, `no_response_contains`, `any_response_contains`, `no_raw_jinja`, `min_responses`, `initial_bot_replies` |
+
+The end-of-conversation edges showing as uncovered is the kind of actionable gap the coverage module is built to surface — scenarios don't currently walk into the terminal `EndCallNode`.
+
+---
+
 ## What's inside
 
 | File | What |
@@ -156,6 +200,7 @@ The Insurance Claims workflow was created programmatically via the SDK (`scripts
 | [docs/report.md](docs/report.md) | Results, precision analysis, platform learnings |
 | [docs/approach.md](docs/approach.md) | One-page pitch |
 | [docs/discovery-report.md](docs/discovery-report.md) | Platform reverse-engineering (724 lines) |
+| [docs/ai-sdk-migration.md](docs/ai-sdk-migration.md) | Migration writeup — why, before/after, parity results |
 | [service/](service/) | The microservice (16 files, ~2000 LOC) |
 | [scripts/create-demo-workflow.ts](service/scripts/create-demo-workflow.ts) | Creates the Insurance Claims demo agent via SDK |
 
@@ -167,7 +212,7 @@ The Insurance Claims workflow was created programmatically via the SDK (`scripts
 |---|---|
 | Language | TypeScript, Node 20+ |
 | HTTP | Hono |
-| LLM | OpenAI Responses API, gpt-5.2 |
+| LLM | OpenAI Responses API, gpt-5.2 (via Vercel AI SDK — `ai@5`, `@ai-sdk/openai@2`) |
 | Platform client | ZenLabs SDK (Fern-generated) |
 | Auth | BasicAuth → Bearer token (programmatic) |
 | Validation | Zod + custom consistency rules |
