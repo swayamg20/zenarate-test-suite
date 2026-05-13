@@ -7,6 +7,7 @@ import { loadWorkflow } from "../spec/load.ts";
 import { normalize, toNodeContexts } from "../spec/normalize.ts";
 import { generateAll } from "../generator/orchestrate.ts";
 import { publishSuite } from "../publisher/publish.ts";
+import { verifyAndRepair } from "../verifier/verify.ts";
 
 const app = new Hono();
 
@@ -16,6 +17,7 @@ app.post("/agents/:wfId/generate-suite", async (c) => {
 
   const body = await c.req.json().catch(() => ({}));
   const dryRun = body.dry_run === true;
+  const verify = body.verify !== false; // default: verify enabled
 
   const reqId = crypto.randomUUID();
   const t0 = Date.now();
@@ -34,7 +36,7 @@ app.post("/agents/:wfId/generate-suite", async (c) => {
     const spec = normalize(raw);
 
     log({ step: "generate" });
-    const { perNode, allScenarios, coverage } = await generateAll(spec, c.req.raw.signal);
+    const { perNode, allScenarios, coverage, scenarioLaneMap } = await generateAll(spec, c.req.raw.signal);
 
     if (dryRun) {
       log({ step: "done", dry_run: true, total_ms: Date.now() - t0 });
@@ -46,6 +48,25 @@ app.post("/agents/:wfId/generate-suite", async (c) => {
       title: `Generated tests — ${spec.title} (${new Date().toISOString().slice(0, 16)})`,
     });
 
+    // Verify-by-running loop: run suite, check results, repair failures
+    let verification = null;
+    if (verify) {
+      log({ step: "verify", suite_id: result.suite_id });
+      verification = await verifyAndRepair(
+        client,
+        result.suite_id,
+        spec,
+        scenarioLaneMap,
+        c.req.raw.signal,
+      );
+      log({
+        step: "verify_done",
+        passed: verification.passed.length,
+        dropped: verification.dropped.length,
+        total_runs: verification.total_runs,
+      });
+    }
+
     log({ step: "done", suite_id: result.suite_id, total_ms: Date.now() - t0 });
 
     return c.json({
@@ -56,6 +77,7 @@ app.post("/agents/:wfId/generate-suite", async (c) => {
         trivial_count: r.trivial_count,
       })),
       coverage,
+      verification,
       elapsed_ms: Date.now() - t0,
     });
   } catch (e: any) {

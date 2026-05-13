@@ -17,6 +17,8 @@ export interface GenerateAllResult {
   perNode: PerNodeResult[];
   allScenarios: ScenarioInput[];
   coverage: CoverageReport;
+  /** Maps scenario name → LaneContext for the verifier's repair loop */
+  scenarioLaneMap: Map<string, LaneContext>;
 }
 
 export async function generateAll(
@@ -28,7 +30,7 @@ export async function generateAll(
   const lanes = buildLaneContexts(contexts);
 
   // Accumulate per-lane results, then group by node
-  const laneResults: { node: string; scenario: ScenarioInput | null; trivial: boolean }[] = [];
+  const laneResults: { node: string; scenario: ScenarioInput | null; trivial: boolean; laneCtx: LaneContext }[] = [];
 
   // Simple concurrency limiter via a sliding window
   const queue = [...lanes];
@@ -43,6 +45,7 @@ export async function generateAll(
             node: laneCtx.lane.node_title,
             scenario: r.scenario,
             trivial: r.trivial,
+            laneCtx,
           });
         })
         .catch(err => {
@@ -54,7 +57,7 @@ export async function generateAll(
               error: String(err),
             }),
           );
-          laneResults.push({ node: laneCtx.lane.node_title, scenario: null, trivial: false });
+          laneResults.push({ node: laneCtx.lane.node_title, scenario: null, trivial: false, laneCtx });
         })
         .finally(() => {
           inflight.delete(p);
@@ -83,7 +86,15 @@ export async function generateAll(
     perNode.push({ node, scenarios: entry.scenarios, trivial_count: entry.trivial_count });
   }
 
+  // Build scenario → LaneContext map for verifier
+  const scenarioLaneMap = new Map<string, LaneContext>();
+  for (const lr of laneResults) {
+    if (lr.scenario) {
+      scenarioLaneMap.set(lr.scenario.name, lr.laneCtx);
+    }
+  }
+
   const allScenarios = perNode.flatMap(r => r.scenarios);
   const coverage = computeCoverage(spec, allScenarios);
-  return { perNode, allScenarios, coverage };
+  return { perNode, allScenarios, coverage, scenarioLaneMap };
 }
