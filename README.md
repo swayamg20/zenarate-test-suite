@@ -106,14 +106,15 @@ Open the `suite_url` in the dashboard. Hit **Run All**. Watch the tests execute.
 ```
 service/src/
 ├── zenarate/     SDK factory — BasicAuth login, client init
-├── spec/         Workflow → AgentSpec → NodeContext[] (one per node)
-├── generator/    LLM agent loop — 5 tools, per-node, parallel
+├── spec/         Workflow → AgentSpec → NodeContext[] → Swimlane[] (S2 walker)
+├── generator/    LLM agent loop — 5 tools, one scenario per lane, parallel
 ├── validator/    Zod schema + consistency checks (9 assertion types)
+├── verifier/     Run on platform → compare results → repair failed → drop after 2 retries
 ├── publisher/    Hybrid: node_codes (entrypoint) + workflow_config (downstream)
 └── http/         Hono server, one endpoint
 ```
 
-The LLM reasons about what to test. Everything else — HTTP, validation, publishing, turn timing — is deterministic code.
+The deterministic walker decides **what** to test (swimlanes). The LLM decides **how** to test it (user turns). The verifier confirms it actually works by running on the platform.
 
 The agent gets 5 tools (`propose_scenario`, `validate_scenario`, `remove_scenario`, `list_proposed`, `finalize`) and no HTTP access. It cannot publish, fetch data, or call external services. The deterministic shell handles all I/O.
 
@@ -158,6 +159,7 @@ npm test            # 14/14 passing
 
 | Suite | Cases | Coverage |
 |---|---:|---|
+| `test/walker.test.ts` | 11 | Deterministic swimlane walker — EndCallNode skip, single/multiple collects, edge multiplication, ClaimsIntake 5-lane fixture, speaks-only passthrough, transfer/end sealing, leftover merge, `buildLaneContexts` index/total. |
 | `test/generator.test.ts` | 7 | Agent loop wiring via `MockLanguageModelV2` from `ai/test`. Happy path, step-cap force-finalize, malformed-args repair, finalize-without-validate drop, `prepareStep` validate-after-propose enforcement, validator-side `generateObject` repair (success + failure). |
 | `test/coverage.test.ts` | 7 | `computeCoverage` against synthetic 3-node specs. Partial / full node coverage, edge coverage including target-node arrival heuristic, branching, writable-variable coverage, assertion-type union, best-effort read coverage. |
 
@@ -203,6 +205,50 @@ The end-of-conversation edges showing as uncovered is the kind of actionable gap
 | [docs/ai-sdk-migration.md](docs/ai-sdk-migration.md) | Migration writeup — why, before/after, parity results |
 | [service/](service/) | The microservice (16 files, ~2000 LOC) |
 | [scripts/create-demo-workflow.ts](service/scripts/create-demo-workflow.ts) | Creates the Insurance Claims demo agent via SDK |
+
+---
+
+## Discussion
+
+### Q1. Why S2 (per-step) over S1 (minimum) or S3 (DFS)?
+
+S2 means one swimlane per Collect, Transfer, or End step. The platform's test runner asserts at step granularity — when a scenario fails, the result tells you which step broke. If the test count matches the step count, each failure maps 1:1 to a specific step. That's the property you want.
+
+S1 (one lane per branch-defined swimlane) under-tests. A node with three Collects in a row and no conditions produces one lane. If the second Collect is broken, the single scenario fails but doesn't isolate which Collect caused it. S3 (every unique root-to-terminal DFS path) over-tests. Two IF/ELSE conditions produce four paths, but many of those paths share the same Collect steps — you'd be testing the same step multiple times from different entry conditions, paying LLM cost for redundant coverage.
+
+S2 sits in the middle: one scenario per assertable step, no duplication, and the unit of coverage matches the unit of assertion. For the Outbound Reservation agent, S2 produces 22 swimlanes — the right granularity for a 5-node agent with 35 instruction steps.
+
+### Q2. How do you make the LLM-generated user turns deterministically land at the targeted swimlane?
+
+The answer is: you don't trust the LLM. You verify.
+
+The pipeline has two phases. First, the LLM generates user turns targeting a specific swimlane — the prompt pins the lane's steps, the target edge, and the test_focus label. The LLM proposes one scenario, validates it against schema + consistency checks, and finalizes. This is plan-and-emit: structured prompt in, structured scenario out.
+
+Second, the verifier runs the entire suite on the platform via `suitesRunCreate`, polls until completion, and reads per-scenario results. Each result includes the full conversation transcript — what the bot actually said and what steps it actually walked. Failed scenarios get regenerated with the actual conversation trace injected as corrective context: "You aimed for collect(policy_number) but the bot went here instead. Here's what actually happened." The verifier caps at 2 repair attempts per scenario. After a third failure, the scenario is dropped and logged with the reason.
+
+On the Outbound Reservation agent, 19 of 22 scenarios passed after verification. The 3 dropped scenarios were in ReservationConfirmation — a 12-step node with complex transfer branching where the LLM couldn't reliably steer the agent down the intended path. Cleanly dropping those and logging why is more valuable than shipping scenarios that test the wrong thing.
+
+### Q3. What's in your prompt to the LLM, and what's not?
+
+The system prompt (~410 lines) has four layers. First, the step-to-turn mapping rules: speak(exact) → tts_say, speak(flexible) → any_response_contains, collect → user turn + extracted_variables, set_value → silent + variable_types, etc. These are deterministic rules the LLM applies mechanically — no creativity needed. Second, the assertion computation rules: how to calculate initial_bot_replies, min_responses, excluded_variables, no_response_contains. Third, three complete reference scenarios from the platform's own seed suites, showing the exact output format. Fourth, the swimlane directive: "You are given ONE swimlane. Generate exactly ONE scenario. Do NOT decide what to test."
+
+What's deliberately absent: no "be creative" or persona instructions. No temperature jitter — we run at 0.3 for consistency. No open-ended coverage guidance — the walker already decided what to test, so the prompt doesn't ask the LLM to enumerate branches or choose paths. The prompt is structured input → structured output. The LLM's job is translation (steps to turns), not strategy (what to test).
+
+### Q4. SDK or MCP for the writer? Why not the other?
+
+SDK. The autogen pipeline creates 16-22 scenarios programmatically in a loop — that's a script job, not a conversation. The SDK gives you `suitesCreate`, `scenariosCreate`, `suitesRunCreate`, `resultsList` — all the CRUD you need, callable from code, runnable in CI.
+
+MCP (via Claude Desktop) is the right tool for reviewing the output afterward. You'd open the generated suite, walk through each scenario conversationally, ask Claude to explain why a specific assertion exists or suggest edits to the user turns. That's human-in-the-loop review — MCP's strength. But the generation itself is a pipeline: load → walk → generate → verify → publish. SDK fits that shape; MCP doesn't.
+
+### Q5. What does the take-home not cover that production will demand?
+
+Integration step side effects. The generator treats Integration steps (HTTP callouts to external systems) as black boxes — it doesn't know what they return or how they affect downstream variables. A production system would need mock responses for those steps or a way to snapshot their return values.
+
+Multi-node edge routing. The swimlane walker operates within a single node. Testing that the agent correctly transitions from Authentication → ReservationConfirmation → StayDetailsCollection requires scenarios that span multiple nodes — the walker would need to compose cross-node paths, not just intra-node lanes.
+
+Failure mode coverage. What happens when the LLM times out mid-collection? When a transfer target is unavailable? When a variable fails phone number validation? These are runtime failure paths that the current generator can't reason about because they depend on platform behavior, not workflow structure.
+
+Variable typing edge cases. The platform's validation for Phone, Email, Date, and Address types has undocumented rules. A production generator would need a per-type fragment library — known-good and known-bad values for each validation type — rather than relying on the LLM to guess plausible phone numbers.
 
 ---
 
