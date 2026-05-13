@@ -3,7 +3,9 @@ import type { ScenarioInput } from "../validator/schema.ts";
 import type { CoverageReport } from "../coverage/index.ts";
 import { computeCoverage } from "../coverage/index.ts";
 import { toNodeContexts } from "../spec/normalize.ts";
-import { generateForNode } from "./agent.ts";
+import { buildLaneContexts } from "../spec/walker.ts";
+import type { LaneContext } from "../spec/walker.ts";
+import { generateForLane } from "./agent.ts";
 
 export interface PerNodeResult {
   node: string;
@@ -23,33 +25,36 @@ export async function generateAll(
   maxConcurrency = parseInt(process.env.GENERATOR_MAX_CONCURRENCY ?? "3", 10),
 ): Promise<GenerateAllResult> {
   const contexts = toNodeContexts(spec);
-  const results: PerNodeResult[] = [];
+  const lanes = buildLaneContexts(contexts);
+
+  // Accumulate per-lane results, then group by node
+  const laneResults: { node: string; scenario: ScenarioInput | null; trivial: boolean }[] = [];
 
   // Simple concurrency limiter via a sliding window
-  const queue = [...contexts];
+  const queue = [...lanes];
   const inflight = new Set<Promise<void>>();
 
   while (queue.length > 0 || inflight.size > 0) {
     while (inflight.size < maxConcurrency && queue.length > 0) {
-      const ctx = queue.shift()!;
-      const p = generateForNode(ctx, spec, abortSignal)
+      const laneCtx = queue.shift()!;
+      const p = generateForLane(laneCtx, spec, abortSignal)
         .then(r => {
-          results.push({
-            node: ctx.node.title,
-            scenarios: r.scenarios,
-            trivial_count: r.trivial_count,
+          laneResults.push({
+            node: laneCtx.lane.node_title,
+            scenario: r.scenario,
+            trivial: r.trivial,
           });
         })
         .catch(err => {
-          // Log and continue — one node failing shouldn't kill the whole run
           console.error(
             JSON.stringify({
               step: "generate",
-              node: ctx.node.title,
+              node: laneCtx.lane.node_title,
+              lane: laneCtx.lane.id,
               error: String(err),
             }),
           );
-          results.push({ node: ctx.node.title, scenarios: [], trivial_count: 0 });
+          laneResults.push({ node: laneCtx.lane.node_title, scenario: null, trivial: false });
         })
         .finally(() => {
           inflight.delete(p);
@@ -59,7 +64,26 @@ export async function generateAll(
     if (inflight.size > 0) await Promise.race(inflight);
   }
 
-  const allScenarios = results.flatMap(r => r.scenarios);
+  // Group lane results by node to produce PerNodeResult[]
+  const nodeMap = new Map<string, { scenarios: ScenarioInput[]; trivial_count: number }>();
+  for (const lr of laneResults) {
+    let entry = nodeMap.get(lr.node);
+    if (!entry) {
+      entry = { scenarios: [], trivial_count: 0 };
+      nodeMap.set(lr.node, entry);
+    }
+    if (lr.scenario) {
+      entry.scenarios.push(lr.scenario);
+      if (lr.trivial) entry.trivial_count += 1;
+    }
+  }
+
+  const perNode: PerNodeResult[] = [];
+  for (const [node, entry] of nodeMap) {
+    perNode.push({ node, scenarios: entry.scenarios, trivial_count: entry.trivial_count });
+  }
+
+  const allScenarios = perNode.flatMap(r => r.scenarios);
   const coverage = computeCoverage(spec, allScenarios);
-  return { perNode: results, allScenarios, coverage };
+  return { perNode, allScenarios, coverage };
 }

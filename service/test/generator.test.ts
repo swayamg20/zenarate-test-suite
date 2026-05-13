@@ -7,8 +7,9 @@ import type {
   LanguageModelV2Content,
 } from "@ai-sdk/provider";
 
-import { generateForNode } from "../src/generator/agent.ts";
+import { generateForLane } from "../src/generator/agent.ts";
 import type { AgentSpec, NodeContext, SpecNode } from "../src/spec/types.ts";
+import type { LaneContext } from "../src/spec/walker.ts";
 import type { ScenarioInput } from "../src/validator/schema.ts";
 
 const require = createRequire(import.meta.url);
@@ -112,6 +113,23 @@ const ctx: NodeContext = {
   upstream_variables: [],
 };
 
+function toLaneCtx(nodeCtx: NodeContext): LaneContext {
+  return {
+    nodeCtx,
+    lane: {
+      id: `${nodeCtx.node.title}::lane_0`,
+      node_title: nodeCtx.node.title,
+      steps: nodeCtx.node.instruction_steps,
+      start_index: 0,
+      end_index: Math.max(0, nodeCtx.node.instruction_steps.length - 1),
+      edge: null,
+      test_focus: "full_node",
+    },
+    total_lanes: 1,
+    lane_index: 0,
+  };
+}
+
 const validScenario = (name = "captures_first_name"): ScenarioInput => ({
   name,
   description: "Collects the caller's first name.",
@@ -203,13 +221,12 @@ function logEvents(logs: unknown[]) {
   );
 }
 
-test("generateForNode finalizes a validated scenario", async () => {
+test("generateForLane finalizes a validated scenario", async () => {
   const { result, logs } = await captureLogs(() =>
-    generateForNode(
-      ctx,
+    generateForLane(
+      toLaneCtx(ctx),
       spec,
       undefined,
-      // Option B: inject the model because generateForNode owns the production model construction.
       mockModelForSteps([
         [toolCall("call-1", "propose_scenario", { scenario: validScenario() })],
         [toolCall("call-2", "validate_scenario", { index: 0 })],
@@ -220,43 +237,42 @@ test("generateForNode finalizes a validated scenario", async () => {
 
   const events = logEvents(logs);
 
-  assert.equal(result.scenarios.length, 1);
-  assert.equal(result.scenarios[0]?.name, "captures_first_name");
+  assert.equal(result.scenario?.name, "captures_first_name");
   assert.equal(result.iterations, 3);
   assert.equal(events.some((entry) => entry.event === "tool_repair"), false);
   assert.equal(events.some((entry) => entry.event === "validation_failed"), false);
   assert.equal(events.some((entry) => entry.event === "post_loop_dropped"), false);
 });
 
-test("generateForNode force-finalizes after the step cap", async () => {
-  const steps = Array.from({ length: 12 }, (_, index) => [
+test("generateForLane force-finalizes after the step cap", async () => {
+  const steps = Array.from({ length: 6 }, (_, index) => [
     toolCall(`call-${index}`, "propose_scenario", {
       scenario: validScenario(`unvalidated_${index}`),
     }),
   ]);
 
   const { result } = await captureLogs(() =>
-    generateForNode(
-      ctx,
+    generateForLane(
+      toLaneCtx(ctx),
       spec,
       undefined,
       mockModelForSteps(steps),
     ),
   );
 
-  assert.equal(result.iterations, 12);
-  assert.equal(result.scenarios.length, 0);
+  assert.equal(result.iterations, 6);
+  assert.equal(result.scenario, null);
 });
 
-test("generateForNode repairs malformed tool args without crashing", async () => {
+test("generateForLane repairs malformed tool args without crashing", async () => {
   const malformedScenario = {
     turns: [{ text: "Hello." }],
     assertions: { any_response_contains: ["hello"] },
   };
 
   const { result, logs } = await captureLogs(() =>
-    generateForNode(
-      ctx,
+    generateForLane(
+      toLaneCtx(ctx),
       spec,
       undefined,
       mockModelForSteps([
@@ -268,7 +284,7 @@ test("generateForNode repairs malformed tool args without crashing", async () =>
 
   const events = logEvents(logs);
 
-  assert.equal(result.scenarios.length, 0);
+  assert.equal(result.scenario, null);
   assert.equal(
     events.some(
       (entry) =>
@@ -279,10 +295,10 @@ test("generateForNode repairs malformed tool args without crashing", async () =>
   );
 });
 
-test("generateForNode drops unvalidated scenarios on finalize", async () => {
+test("generateForLane drops unvalidated scenarios on finalize", async () => {
   const { result, logs } = await captureLogs(() =>
-    generateForNode(
-      ctx,
+    generateForLane(
+      toLaneCtx(ctx),
       spec,
       undefined,
       mockModelForSteps([
@@ -296,18 +312,18 @@ test("generateForNode drops unvalidated scenarios on finalize", async () => {
     (entry) => entry.event === "finalize_dropped",
   );
 
-  assert.equal(result.scenarios.length, 0);
+  assert.equal(result.scenario, null);
   assert.equal(droppedEvents.length > 0, true);
   assert.deepEqual(droppedEvents[0]?.dropped, ["captures_first_name"]);
 });
 
-test("generateForNode prevents back-to-back propose_scenario via prepareStep", async () => {
+test("generateForLane prevents back-to-back propose_scenario via prepareStep", async () => {
   const toolNamesByCall: string[][] = [];
 
   await captureLogs(async () => {
     try {
-      await generateForNode(
-        ctx,
+      await generateForLane(
+        toLaneCtx(ctx),
         spec,
         undefined,
         mockModelForSteps(
@@ -344,7 +360,7 @@ test("generateForNode prevents back-to-back propose_scenario via prepareStep", a
   ]);
 });
 
-test("generateForNode repairs an invalid scenario via generateObject and accepts it", async () => {
+test("generateForLane repairs an invalid scenario via generateObject and accepts it", async () => {
   const modelInputs: string[] = [];
   let repairCalls = 0;
   const repairedScenario: ScenarioInput = {
@@ -358,8 +374,8 @@ test("generateForNode repairs an invalid scenario via generateObject and accepts
   };
 
   const { result, logs } = await captureLogs(() =>
-    generateForNode(
-      ctx,
+    generateForLane(
+      toLaneCtx(ctx),
       spec,
       undefined,
       mockModelForSteps(
@@ -376,7 +392,7 @@ test("generateForNode repairs an invalid scenario via generateObject and accepts
           modelInputs.push(JSON.stringify(options.prompt));
         },
       ),
-      async (scenario, errors) => {
+      async (scenario: ScenarioInput, errors: string[]) => {
         repairCalls += 1;
         assert.equal(scenario.name, "needs_repair");
         assert.equal(
@@ -384,7 +400,7 @@ test("generateForNode repairs an invalid scenario via generateObject and accepts
           "Sam",
         );
         assert.equal(
-          errors.some((error) => error.includes("last_name")),
+          errors.some((error: string) => error.includes("last_name")),
           true,
         );
         return repairedScenario;
@@ -397,13 +413,13 @@ test("generateForNode repairs an invalid scenario via generateObject and accepts
 
   assert.equal(repairCalls, 1);
   assert.equal(validateResponseSeenByModel.includes('"repaired":true'), true);
-  assert.equal(result.scenarios.length, 1);
+  assert.equal(result.scenario?.name, "needs_repair");
   assert.equal(
-    result.scenarios[0]?.assertions?.extracted_variables?.first_name,
+    result.scenario?.assertions?.extracted_variables?.first_name,
     "Riley",
   );
   assert.equal(
-    result.scenarios[0]?.assertions?.extracted_variables?.last_name,
+    result.scenario?.assertions?.extracted_variables?.last_name,
     undefined,
   );
   assert.equal(
@@ -412,13 +428,13 @@ test("generateForNode repairs an invalid scenario via generateObject and accepts
   );
 });
 
-test("generateForNode reports repair_failed when generateObject still fails validation", async () => {
+test("generateForLane reports repair_failed when generateObject still fails validation", async () => {
   const modelInputs: string[] = [];
   let repairCalls = 0;
 
   const { result, logs } = await captureLogs(() =>
-    generateForNode(
-      ctx,
+    generateForLane(
+      toLaneCtx(ctx),
       spec,
       undefined,
       mockModelForSteps(
@@ -453,7 +469,7 @@ test("generateForNode reports repair_failed when generateObject still fails vali
   assert.equal(repairCalls, 1);
   assert.equal(validateResponseSeenByModel.includes('"repair_failed":true'), true);
   assert.equal(validateResponseSeenByModel.includes('"repair_attempted":true'), true);
-  assert.equal(result.scenarios.length, 0);
+  assert.equal(result.scenario, null);
   assert.equal(listResponseSeenByModel.includes('"name":"needs_repair"'), true);
   assert.equal(listResponseSeenByModel.includes('"validated":false'), true);
   assert.equal(listResponseSeenByModel.includes('"last_name"'), true);

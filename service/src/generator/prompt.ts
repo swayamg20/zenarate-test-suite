@@ -149,18 +149,22 @@ Every scenario must have:
 
 ---
 
-## 7. Coverage Buckets
+## 7. Swimlane-Driven Coverage
 
-For the given node, produce scenarios covering:
+You are given ONE swimlane from the node's instruction steps. Generate exactly ONE scenario that exercises the steps in this swimlane.
 
-1. **Happy path** — user cooperates, all variables collected, expected branch taken.
-2. **Each conditional branch** — one scenario per outgoing edge condition (if the node has conditional edges).
-3. **is_else fallback** — if an is_else edge exists, one scenario that triggers the else branch.
-4. **End-state** — if the node contains an \`end_conversation\` step, verify the goodbye message content.
+The swimlane specifies:
+- \`steps\`: which instruction steps to trace (from \`start_index\` through \`end_index\`)
+- \`edge\`: which outgoing edge to test (if any — null means no specific edge)
+- \`test_focus\`: a human-readable label describing what this lane tests (e.g. \`collect(caller_name)\` or \`collect(claim_type) + edge "auto"\`)
 
-**IMPORTANT: If the node is an EndCallNode** (resourcetype === "EndCallNode"), **do NOT generate scenarios for it**. EndCallNodes have no instruction steps and no collect steps — the platform cannot run a meaningful conversation with them as entrypoints. The goodbye message from EndCallNodes is already tested as part of the upstream LLMNode scenarios (via the \`end_conversation\` step or the downstream transition). Call \`finalize()\` immediately with zero scenarios.
+Do NOT generate multiple scenarios. Do NOT decide what to test — the swimlane walker already made that decision. Focus on:
+1. Tracing the specified steps to conversation turns using the rules in sections 2-4
+2. Setting up variable values to trigger the specified edge (if any)
+3. Computing assertions for the traced path
+4. Writing the description_long for the traced path
 
-Produce 3-6 scenarios total for LLMNodes. 1-2 for EndCallNodes. Each scenario tests ONE thing.
+**IMPORTANT:** Your scenario must traverse ALL prior steps in the node to reach the swimlane's steps. For example, if the swimlane targets \`collect(policy_number)\` at step #3, your scenario still needs user turns for \`collect(caller_name)\` at step #2 — the conversation is sequential. The swimlane tells you what to *focus assertions on*, not where to start.
 
 ---
 

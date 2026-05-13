@@ -1,7 +1,8 @@
 import { generateText, hasToolCall, stepCountIs } from "ai";
 import type { LanguageModel } from "ai";
 import { openai } from "@ai-sdk/openai";
-import type { NodeContext, AgentSpec } from "../spec/types.ts";
+import type { AgentSpec } from "../spec/types.ts";
+import type { LaneContext } from "../spec/walker.ts";
 import type { ScenarioInput } from "../validator/schema.ts";
 import { isTrivial } from "../validator/triviality.ts";
 import { GeneratorToolset } from "./tools.ts";
@@ -9,26 +10,27 @@ import type { ScenarioRepair } from "./tools.ts";
 import { createGeneratorTools, createScenarioRepair } from "./ai-sdk-tools.ts";
 import { SYSTEM_PROMPT, FEW_SHOT_EXEMPLARS } from "./prompt.ts";
 
-export interface GenerateForNodeResult {
-  scenarios: ScenarioInput[];
-  trivial_count: number;
+export interface GenerateForLaneResult {
+  scenario: ScenarioInput | null;
+  trivial: boolean;
   iterations: number;
 }
 
 const log = (event: object) =>
   console.log(JSON.stringify({ ts: new Date().toISOString(), step: "generate", ...event }));
 
-export async function generateForNode(
-  ctx: NodeContext,
+export async function generateForLane(
+  laneCtx: LaneContext,
   spec: AgentSpec,
   abortSignal?: AbortSignal,
   model?: LanguageModel,
   repair?: ScenarioRepair,
-): Promise<GenerateForNodeResult> {
-  const node = ctx.node.title;
-  log({ event: "node_start", node, outgoing: ctx.outgoing.length });
+): Promise<GenerateForLaneResult> {
+  const { nodeCtx, lane } = laneCtx;
+  const node = nodeCtx.node.title;
+  log({ event: "lane_start", node, lane: lane.id, test_focus: lane.test_focus });
 
-  const toolset = new GeneratorToolset(ctx, spec, repair ?? createScenarioRepair());
+  const toolset = new GeneratorToolset(nodeCtx, spec, repair ?? createScenarioRepair());
 
   const systemPrompt =
     SYSTEM_PROMPT +
@@ -36,11 +38,17 @@ export async function generateForNode(
     JSON.stringify(FEW_SHOT_EXEMPLARS, null, 2);
 
   const userMessage =
-    `Generate test scenarios for this node. NodeContext:\n\n` +
+    `Generate ONE test scenario for swimlane ${lane.id}.\n\n` +
+    `## Swimlane\n\n` +
     "```json\n" +
-    JSON.stringify(ctx, null, 2) +
+    JSON.stringify(lane, null, 2) +
     "\n```\n\n" +
-    "Cover the buckets I described. Validate each scenario. Then finalize.";
+    `## Full NodeContext\n\n` +
+    "```json\n" +
+    JSON.stringify(nodeCtx, null, 2) +
+    "\n```\n\n" +
+    "Trace the steps in this swimlane, generate user turns, compute assertions. " +
+    "Propose ONE scenario, validate it, then finalize.";
 
   let stepIndex = 0;
   const result = await generateText({
@@ -49,7 +57,7 @@ export async function generateForNode(
     system: systemPrompt,
     prompt: userMessage,
     tools: createGeneratorTools(toolset),
-    stopWhen: [hasToolCall("finalize"), stepCountIs(12)],
+    stopWhen: [hasToolCall("finalize"), stepCountIs(6)],
     prepareStep: ({ steps }) => {
       // After proposing, force a validate/remove/list/finalize step before proposing again.
       if (steps.at(-1)?.toolCalls.some((call) => call.toolName === "propose_scenario")) {
@@ -65,11 +73,12 @@ export async function generateForNode(
       return undefined;
     },
     abortSignal,
-    experimental_telemetry: { isEnabled: true, functionId: "generateForNode" },
+    experimental_telemetry: { isEnabled: true, functionId: "generateForLane" },
     experimental_repairToolCall: async ({ toolCall, error }) => {
       log({
         event: "tool_repair",
         node,
+        lane: lane.id,
         tool: toolCall.toolName,
         error: String(error),
       });
@@ -81,6 +90,7 @@ export async function generateForNode(
       log({
         event: "llm_response",
         node,
+        lane: lane.id,
         iteration,
         tool_calls: toolCalls.map((c) => c.toolName),
         usage,
@@ -88,24 +98,23 @@ export async function generateForNode(
     },
   });
 
-  // If the loop ended without a finalize call, force finalize now
-  // finalize() now drops unvalidated scenarios instead of blocking
-  const final = toolset.isFinalized()
-    ? toolset.finalize()
-    : toolset.finalize();
+  // Force finalize if the loop ended without one
+  const final = toolset.finalize();
 
   if (final.dropped && final.dropped.length > 0) {
-    log({ event: "post_loop_dropped", node, dropped: final.dropped });
+    log({ event: "post_loop_dropped", node, lane: lane.id, dropped: final.dropped });
   }
 
-  const trivial_count = final.scenarios.filter((s) => isTrivial(s)).length;
+  const scenario = final.scenarios[0] ?? null;
+  const trivial = scenario ? isTrivial(scenario) : false;
   const iterations = result.steps?.length ?? -1;
   log({
-    event: "node_done",
+    event: "lane_done",
     node,
-    scenarios: final.scenarios.length,
-    trivial_count,
+    lane: lane.id,
+    has_scenario: scenario !== null,
+    trivial,
     iterations,
   });
-  return { scenarios: final.scenarios, trivial_count, iterations };
+  return { scenario, trivial, iterations };
 }
